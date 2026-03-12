@@ -4,15 +4,6 @@ mkdir -p logs
 
 TASKS=(
   "gsm8k:128"
-  "math500:128"
-  "aime24:30"
-  "aime25:30"
-  "humaneval:164"
-  "mbpp:128"
-  "livecodebench:128"
-  "swe-bench:128"
-  "mt-bench:80"
-  "alpaca:128"
 )
 
 for task in "${TASKS[@]}"; do
@@ -23,9 +14,9 @@ for task in "${TASKS[@]}"; do
   echo "========================================================"
 
   torchrun \
-    --nproc_per_node=8 \
+    --nproc_per_node=1 \
     --master_port=29600 \
-    benchmark.py \
+    -m scheme.mask_50_redraft \
     --dataset "$DATASET_NAME" \
     --max-samples "$MAX_SAMPLES" \
     --model-name-or-path Qwen/Qwen3-4B \
@@ -33,5 +24,3 @@ for task in "${TASKS[@]}"; do
     --max-new-tokens 2048 \
     --temperature 0.0 \
     2>&1 | tee "logs/${DATASET_NAME}.log"
-
-done

@@ -34,6 +34,16 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
+
+def apply_vcd_logits(
+    first_logits: torch.Tensor,
+    second_logits: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    if alpha == 0.0:
+        return first_logits
+    return (1.0 + alpha) * first_logits - alpha * second_logits
+
 def load_and_process_dataset(data_name: str):
     # Math datasets
     if data_name == "gsm8k":
@@ -88,8 +98,17 @@ def load_and_process_dataset(data_name: str):
     
     elif data_name == "livecodebench":
         base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"
-        allowed_files = ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"]
-        urls = [base + fn for fn in allowed_files]
+        files = [
+            "test.jsonl",
+            "test2.jsonl",
+            "test3.jsonl",
+            "test4.jsonl",
+            "test5.jsonl",
+            "test6.jsonl",
+        ]
+
+        urls = [base + f for f in files]
+        
         dataset = load_dataset("json", data_files={"test": urls})["test"]
         def format_lcb(doc):
             system_prompt = (
@@ -106,7 +125,7 @@ def load_and_process_dataset(data_name: str):
                 code_block = "```python\n# YOUR CODE HERE\n```"
             answer_footer = "### Answer: (use the provided format with backticks)"
             return f"{system_prompt}\n\n{question_block}\n\n{format_message}\n{code_block}\n\n{answer_footer}"
-        target_features = Features({"turns": Sequence(Value("large_string"))})
+        target_features = Features({"turns": Sequence(Value("string"))})
         dataset = dataset.map(
             lambda x: {"turns": [format_lcb(x)]},
             remove_columns=dataset.column_names,
