@@ -16,7 +16,7 @@ for task in "${TASKS[@]}"; do
   torchrun \
     --nproc_per_node=1 \
     --master_port=29600 \
-    -m scheme.contrastive_decode_2 \
+    -m scheme.contrastive_decode_3 \
     --dataset "$DATASET_NAME" \
     --max-samples "$MAX_SAMPLES" \
     --model-name-or-path Qwen/Qwen3-4B \
