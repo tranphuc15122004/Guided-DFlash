@@ -23,7 +23,7 @@ def remask_second_draft_input(
     block_output_ids: torch.Tensor,
     first_draft_ids: torch.Tensor,
     mask_token_id: int,
-    remask_ratio: float = 0.5,
+    remask_ratio: float = 1.0,
 ) -> torch.Tensor:
     remasked_block_output_ids = block_output_ids.clone()
     remasked_block_output_ids[:, 1:] = first_draft_ids
