@@ -33,6 +33,27 @@ def build_negative_block_output_random(block_output_ids: torch.Tensor, vocab_siz
     negative_block_output_ids[:, 0] = random_tokens
     return negative_block_output_ids
 
+def build_negative_target_hidden(
+    target_hidden: torch.Tensor,
+    dropout_ratio: float = 0.3,
+    noise_std: float = 0.0,
+) -> torch.Tensor:
+    negative_target_hidden = target_hidden.clone()
+
+    if dropout_ratio > 0.0:
+        token_keep_mask = (
+            torch.rand(
+                negative_target_hidden.shape[:2],
+                device=negative_target_hidden.device,
+            ) >= dropout_ratio
+        ).unsqueeze(-1)
+        negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
+
+    if noise_std > 0.0:
+        negative_target_hidden = negative_target_hidden + noise_std * torch.randn_like(negative_target_hidden)
+
+    return negative_target_hidden
+
 def compute_contrastive_draft_logits(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
@@ -41,17 +62,24 @@ def compute_contrastive_draft_logits(
     draft_position_ids: torch.Tensor,
     past_key_values_draft: DynamicCache,
     block_size: int,
+    negative_context_dropout: float,
+    negative_context_noise_std: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = block_output_ids.shape[0]
     
     neg_block_output_ids = build_negative_block_output_random(block_output_ids, target.config.vocab_size)
+    negative_target_hidden = build_negative_target_hidden(
+        target_hidden=target_hidden,
+        dropout_ratio=negative_context_dropout,
+        noise_std=negative_context_noise_std,
+    )
     
     possitive_noise_embedding = target.model.embed_tokens(block_output_ids)
     negative_noise_embedding = target.model.embed_tokens(neg_block_output_ids)
     
 
     paired_noise_embedding = torch.cat([possitive_noise_embedding, negative_noise_embedding], dim=0)
-    paired_hidden = torch.cat([target_hidden, target_hidden], dim=0)
+    paired_hidden = torch.cat([target_hidden, negative_target_hidden], dim=0)
     
     paired_position_ids = torch.cat([draft_position_ids, draft_position_ids], dim=0)
 
@@ -142,6 +170,8 @@ def dflash_generate(
     temperature: float = 0.0,
     vcd_alpha: float = 1.0,
     beta: float = 0.1,
+    negative_context_dropout: float = 0.3,
+    negative_context_noise_std: float = 0.0,
     divergence_accumulator: Optional[List[float]] = None,
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
@@ -194,6 +224,8 @@ def dflash_generate(
                 draft_position_ids=draft_position_ids,
                 past_key_values_draft=past_key_values_draft,
                 block_size=block_size,
+                negative_context_dropout=negative_context_dropout,
+                negative_context_noise_std=negative_context_noise_std,
             )
             past_key_values_draft.crop(start)
             
@@ -216,6 +248,11 @@ def dflash_generate(
                 logits=final_draft_logits,
                 candidate_mask=candidate_mask,
             )
+            
+            # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
+            n_keep = min(6, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            
             block_output_ids[:, 1:] = sample(final_draft_logits)
             if draft_prefill:
                 draft_prefill = False
@@ -276,7 +313,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--vcd-alpha", type=float, default=1.0)
+    parser.add_argument("--vcd-alpha", type=float, default=0.5)
     parser.add_argument("--vcd-beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
@@ -348,6 +385,8 @@ def main() -> None:
                     temperature=args.temperature,
                     vcd_alpha=args.vcd_alpha,
                     beta=args.vcd_beta,
+                    negative_context_dropout=args.negative_context_dropout,
+                    negative_context_noise_std=args.negative_context_noise_std,
                     divergence_accumulator = divergence_accumulator
                 )
             

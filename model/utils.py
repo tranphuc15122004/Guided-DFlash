@@ -131,5 +131,11 @@ def load_and_process_dataset(data_name: str):
             remove_columns=dataset.column_names,
             features=target_features
         )
+    else:
+        raise ValueError(
+            "Unsupported dataset name: "
+            f"{data_name}. Supported: gsm8k, math500, aime24, aime25, alpaca, mt-bench, "
+            "humaneval, mbpp, lbpp, swe-bench, livecodebench"
+        )
     
     return dataset
