@@ -25,14 +25,14 @@ def extract_context_feature(
     target_hidden = torch.cat(selected_states, dim=-1)
     return target_hidden
 
-def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+def sample(logits: torch.Tensor, temperature: float = 0.0 , gen : torch.Generator = None) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
     bsz, seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size)
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+    return torch.multinomial(probs, num_samples=1 , generator=gen).view(bsz, seq_len)
 
 
 def apply_vcd_logits(
@@ -43,6 +43,12 @@ def apply_vcd_logits(
     if alpha == 0.0:
         return first_logits
     return (1.0 + alpha) * first_logits - alpha * second_logits
+
+def apply_cd_logits(first_logits, second_logits, alpha=1.0):
+    log_p1 = torch.log_softmax(first_logits, dim=-1)
+    log_p2 = torch.log_softmax(second_logits, dim=-1)
+    return log_p1 - alpha * log_p2
+
 
 def load_and_process_dataset(data_name: str):
     # Math datasets

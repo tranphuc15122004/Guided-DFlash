@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 import random
 from itertools import chain
@@ -26,10 +27,31 @@ def cuda_time() -> float:
     return time.perf_counter()
 
 
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.benchmark = True
+
+
 def build_negative_target_hidden(
     target_hidden: torch.Tensor,
     dropout_ratio: float = 0.3,
     noise_std: float = 0.0,
+    gen: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     negative_target_hidden = target_hidden.clone()
 
@@ -38,12 +60,19 @@ def build_negative_target_hidden(
             torch.rand(
                 negative_target_hidden.shape[:2],
                 device=negative_target_hidden.device,
+                generator=gen,
             ) >= dropout_ratio
         ).unsqueeze(-1)
         negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
 
     if noise_std > 0.0:
-        negative_target_hidden = negative_target_hidden + noise_std * torch.randn_like(negative_target_hidden)
+        noise = torch.randn(
+            negative_target_hidden.shape,
+            dtype=negative_target_hidden.dtype,
+            device=negative_target_hidden.device,
+            generator=gen,
+        )
+        negative_target_hidden = negative_target_hidden + noise_std * noise
 
     return negative_target_hidden
 
@@ -58,6 +87,7 @@ def compute_contrastive_draft_logits(
     block_size: int,
     negative_context_dropout: float,
     negative_context_noise_std: float,
+    gen: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = block_output_ids.shape[0]
     noise_embedding = target.model.embed_tokens(block_output_ids)
@@ -65,6 +95,7 @@ def compute_contrastive_draft_logits(
         target_hidden=target_hidden,
         dropout_ratio=negative_context_dropout,
         noise_std=negative_context_noise_std,
+        gen=gen,
     )
 
     paired_hidden = torch.cat([target_hidden, negative_target_hidden], dim=0)
@@ -161,7 +192,11 @@ def dflash_generate(
     negative_context_dropout: float = 0.3,
     negative_context_noise_std: float = 0.0,
     divergence_accumulator: Optional[List[float]] = None,
+    seed: int = 0,
 ) -> SimpleNamespace:
+    gen = torch.Generator(device=model.device)
+    gen.manual_seed(seed)
+
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
@@ -187,7 +222,7 @@ def dflash_generate(
     )
 
     output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
+    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature, gen=gen)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
 
@@ -214,6 +249,7 @@ def dflash_generate(
                 block_size=block_size,
                 negative_context_dropout=negative_context_dropout,
                 negative_context_noise_std=negative_context_noise_std,
+                gen=gen,
             )
             past_key_values_draft.crop(start)
             
@@ -236,7 +272,7 @@ def dflash_generate(
                 logits=final_draft_logits,
                 candidate_mask=candidate_mask,
             )
-            block_output_ids[:, 1:] = sample(final_draft_logits)
+            block_output_ids[:, 1:] = sample(final_draft_logits, gen=gen)
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -249,7 +285,7 @@ def dflash_generate(
             output_hidden_states=True if block_size > 1 else False,
         )
 
-        posterior = sample(output.logits, temperature)
+        posterior = sample(output.logits, temperature, gen=gen)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -300,20 +336,25 @@ def main() -> None:
     parser.add_argument("--vcd-beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable fully deterministic behavior for reproducible runs.",
+    )
     args = parser.parse_args()
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    set_global_seed(args.seed, deterministic=args.deterministic)
 
     dist.init()
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
     def has_flash_attn():
+        if args.deterministic:
+            logger.info("Deterministic mode enabled. Forcing SDPA attention backend.")
+            return False
         try:
             import flash_attn
             return True
@@ -341,13 +382,15 @@ def main() -> None:
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
     divergence_accumulator: List[float] = [] 
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
+    base_seed = args.seed
     for idx in tqdm(indices, disable=not dist.is_main()):
+        sample_seed = base_seed + idx + dist.rank() * 10_000_000
         instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
@@ -370,7 +413,8 @@ def main() -> None:
                     beta=args.vcd_beta,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
-                    divergence_accumulator = divergence_accumulator
+                    divergence_accumulator=divergence_accumulator,
+                    seed=sample_seed + bs,
                 )
             
             spec_response = response[block_size]
