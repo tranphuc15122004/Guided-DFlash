@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
+import random
 import time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import requests
 import torch
 from transformers import AutoTokenizer
@@ -19,6 +22,29 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
+
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+    else:
+        torch.use_deterministic_algorithms(False)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
 
 def _is_blackwell() -> bool:
     if envs.IS_BLACKWELL.get():
@@ -298,7 +324,16 @@ def main() -> None:
         default="flashinfer,fa3,fa4",
         help="Comma-separated list. Will auto-skip fa3 unless SM90 (Hopper), and fa4 unless SM100+ (Blackwell).",
     )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable deterministic runtime settings for reproducible runs.",
+    )
     args = parser.parse_args()
+
+    set_global_seed(args.seed, deterministic=args.deterministic)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
@@ -495,6 +530,8 @@ def main() -> None:
     md_lines.append(f"- draft_model: `{args.draft_model}`")
     md_lines.append(f"- max_new_tokens: `{args.max_new_tokens}`")
     md_lines.append(f"- attention_backends: `{', '.join(attention_backends)}`")
+    md_lines.append(f"- seed: `{args.seed}`")
+    md_lines.append(f"- deterministic: `{bool(args.deterministic)}`")
     md_lines.append(f"- tp_size: `{tp}`")
     md_lines.append(f"- concurrencies: `{', '.join(str(x) for x in concurrencies)}`")
     md_lines.append(f"- questions_per_concurrency: `base={args.questions_per_concurrency_base}`")

@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 import random
 from itertools import chain
@@ -16,6 +17,26 @@ def cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
 
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.benchmark = True
+
 @torch.inference_mode()
 def dflash_generate(
     model: DFlashDraftModel,
@@ -26,7 +47,11 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    seed: int = 0,
 ) -> SimpleNamespace:
+    gen = torch.Generator(device=model.device)
+    gen.manual_seed(seed)
+
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
@@ -52,7 +77,7 @@ def dflash_generate(
     )
 
     output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
+    output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature, gen=gen)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
 
@@ -78,7 +103,7 @@ def dflash_generate(
                 is_causal=False,
             )[:, -block_size+1:, :])
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = sample(draft_logits, gen=gen)
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -91,7 +116,7 @@ def dflash_generate(
             output_hidden_states=True if block_size > 1 else False,
         )
 
-        posterior = sample(output.logits, temperature)
+        posterior = sample(output.logits, temperature, gen=gen)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
@@ -138,20 +163,25 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable fully deterministic behavior for reproducible runs.",
+    )
     args = parser.parse_args()
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    set_global_seed(args.seed, deterministic=args.deterministic)
 
     dist.init()
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
     def has_flash_attn():
+        if args.deterministic:
+            logger.info("Deterministic mode enabled. Forcing SDPA attention backend.")
+            return False
         try:
             import flash_attn
             return True
@@ -179,11 +209,13 @@ def main() -> None:
     dataset = load_and_process_dataset(args.dataset)
 
     if args.max_samples is not None and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
+        dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
+    base_seed = args.seed
     for idx in tqdm(indices, disable=not dist.is_main()):
+        sample_seed = base_seed + idx + dist.rank() * 10_000_000
         instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
@@ -202,6 +234,7 @@ def main() -> None:
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
+                    seed=sample_seed + bs,
                 )
             
             spec_response = response[block_size]
