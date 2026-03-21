@@ -351,7 +351,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", type=float, default=0.5)
+    parser.add_argument("--cd-alpha", type=float, default=0.1)
     parser.add_argument("--cd-beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
