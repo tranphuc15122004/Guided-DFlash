@@ -1,0 +1,4 @@
+pattern,num_cases,mean_delta_vcd_minus_dflash,mean_vcd_acceptance,mean_dflash_acceptance
+coding|<=128,2,-0.027560,6.247219,6.274779
+math|129-512,6,-0.055612,6.691632,6.747244
+math|<=128,120,-0.017713,6.471436,6.489149

@@ -673,7 +673,7 @@ def main() -> None:
     parser.add_argument("--vcd-alpha", type=float, default=0.5)
     parser.add_argument("--vcd-beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
-    parser.add_argument("--negative-context-noise-std", type=float, default=0.1)
+    parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument("--analysis-dir", type=str, default="Analysis/results")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
