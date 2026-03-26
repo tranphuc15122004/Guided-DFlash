@@ -19,7 +19,7 @@ from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from model import DFlashDraftModel, apply_cd_logits, extract_context_feature, load_and_process_dataset, sample
+from model import DFlashDraftModel, apply_vcd_logits, extract_context_feature, load_and_process_dataset, sample
 
 
 def cuda_time() -> float:
@@ -138,7 +138,7 @@ def compute_contrastive_draft_logits(
     return first_draft_logits, second_draft_logits
 
 
-def build_cd_candidate_mask(reference_logits: torch.Tensor, beta: float) -> torch.Tensor:
+def build_vcd_candidate_mask(reference_logits: torch.Tensor, beta: float) -> torch.Tensor:
     reference_probs = torch.softmax(reference_logits, dim=-1)
     max_reference_probs = reference_probs.amax(dim=-1, keepdim=True)
     candidate_mask = reference_probs >= (beta * max_reference_probs)
@@ -147,7 +147,7 @@ def build_cd_candidate_mask(reference_logits: torch.Tensor, beta: float) -> torc
     return candidate_mask
 
 
-def apply_cd_candidate_filter(logits: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
+def apply_vcd_candidate_filter(logits: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
     return logits.masked_fill(~candidate_mask, torch.finfo(logits.dtype).min)
 
 
@@ -189,6 +189,19 @@ def _topk_token_details(
     return out
 
 
+def _estimate_token_hit_probability(
+    logits_1d: torch.Tensor,
+    token_id: int,
+    num_samples: int,
+    gen: Optional[torch.Generator] = None,
+) -> float:
+    if num_samples <= 0:
+        return 0.0
+    probs = torch.softmax(logits_1d, dim=-1)
+    sampled_ids = torch.multinomial(probs, num_samples=num_samples, replacement=True, generator=gen)
+    return float((sampled_ids == token_id).float().mean().item())
+
+
 def _build_reject_reason(record: dict[str, Any]) -> str:
     reasons: list[str] = []
     reasons.append(
@@ -197,54 +210,54 @@ def _build_reject_reason(record: dict[str, Any]) -> str:
     )
     if record["pred_changed"] == 1:
         reasons.append(
-            f"CD đã đổi argmax từ `{record['positive_pred_text']}` sang `{record['cd_pred_text']}`."
+            f"VCD shadow sample đã đổi token từ `{record['sampled_draft_text']}` sang `{record['vcd_shadow_sampled_text']}`."
         )
     else:
-        reasons.append("CD không đổi argmax so với positive ở vị trí reject.")
-    if record["cd_overwritten_by_positive"] == 1:
-        reasons.append("Vị trí này nằm trong vùng bị overwrite bởi positive logits (n_keep), nên tác động CD bị triệt tiêu.")
+        reasons.append("VCD shadow sample không đổi token so với original ở vị trí reject.")
     if record["target_in_candidate_mask"] == 0:
-        reasons.append("Token target không nằm trong candidate mask (beta filter), nên khó được CD chọn.")
-    if record["cd_hit"] == 1 and record["positive_hit"] == 0:
-        reasons.append("CD đã sửa đúng token target tốt hơn positive.")
-    elif record["cd_hit"] == 0 and record["positive_hit"] == 1:
-        reasons.append("CD làm mất token target mà positive vốn chọn đúng.")
-    elif record["cd_hit"] == 0 and record["positive_hit"] == 0:
-        reasons.append("Cả positive và CD đều chưa đưa target token lên top-1.")
+        reasons.append("Token target không nằm trong candidate mask (beta filter), nên khó được VCD chọn.")
+    if record["vcd_shadow_fix_hit"] == 1:
+        reasons.append("VCD shadow sample trùng target token ở vị trí reject, cho thấy có khả năng cứu reject nếu rollout theo VCD.")
+    if record["vcd_hit"] == 1 and record["positive_hit"] == 0:
+        reasons.append("VCD đã sửa đúng token target tốt hơn positive.")
+    elif record["vcd_hit"] == 0 and record["positive_hit"] == 1:
+        reasons.append("VCD làm mất token target mà positive vốn chọn đúng.")
+    elif record["vcd_hit"] == 0 and record["positive_hit"] == 0:
+        reasons.append("Cả positive và VCD đều chưa đưa target token lên top-1.")
     return " ".join(reasons)
 
 
 def _classify_reject_taxonomy(record: dict[str, Any]) -> tuple[str, str]:
     # Priority-based taxonomy: earlier rules represent stronger root-cause signals.
-    if record["cd_overwritten_by_positive"] == 1:
+    if record["vcd_shadow_fix_hit"] == 1:
         return (
-            "overwrite_by_positive_guard",
-            "Vi tri reject nam trong vung n_keep bi overwrite boi positive logits, CD gan nhu khong con tac dung.",
+            "vcd_shadow_can_fix_reject",
+            "Trong che do shadow, token sample tu VCD trung target tai vi tri reject cua original.",
         )
     if record["target_in_candidate_mask"] == 0:
         return (
             "target_filtered_by_candidate_mask",
-            "Token target bi loai khoi candidate mask (beta filter), nen draft/CD kho de de xuat dung target.",
+            "Token target bi loai khoi candidate mask (beta filter), nen draft/VCD kho de de xuat dung target.",
         )
-    if record["positive_hit"] == 1 and record["cd_hit"] == 0:
+    if record["positive_hit"] == 1 and record["vcd_hit"] == 0:
         return (
-            "cd_regression_from_positive",
-            "Positive dung target nhung CD day target xuong, dan den reject.",
+            "vcd_regression_from_positive",
+            "Positive dung target nhung VCD day target xuong, dan den reject.",
         )
-    if record["positive_hit"] == 0 and record["cd_hit"] == 1:
+    if record["positive_hit"] == 0 and record["vcd_hit"] == 1:
         return (
-            "cd_correct_but_sampled_mismatch",
-            "CD dua target len top-1 nhung token draft duoc sample van khac posterior nen van reject.",
+            "vcd_correct_but_sampled_mismatch",
+            "VCD dua target len top-1 nhung token draft duoc sample van khac posterior nen van reject.",
         )
     if record["pred_changed"] == 0 and record["positive_hit"] == 0:
         return (
-            "no_cd_effect_positive_wrong",
-            "CD khong doi huong du doan va positive da sai target tu dau.",
+            "no_vcd_effect_positive_wrong",
+            "VCD khong doi huong du doan va positive da sai target tu dau.",
         )
-    if record["pred_changed"] == 1 and record["cd_hit"] == 0:
+    if record["pred_changed"] == 1 and record["vcd_hit"] == 0:
         return (
-            "cd_shifted_but_still_wrong",
-            "CD co doi huong du doan nhung chua dua target len top-1.",
+            "vcd_shifted_but_still_wrong",
+            "VCD co doi huong du doan nhung chua dua target len top-1.",
         )
     return (
         "posterior_mismatch_other",
@@ -298,11 +311,11 @@ def _maybe_create_plots(report_dir: Path, records: list[dict[str, Any]]) -> list
 
     plot_files: list[str] = []
     pos_hit_rate = float(np.mean([r["positive_hit"] for r in records]))
-    cd_hit_rate = float(np.mean([r["cd_hit"] for r in records]))
+    vcd_hit_rate = float(np.mean([r["vcd_hit"] for r in records]))
     unchanged_rate = float(np.mean([r["pred_changed"] == 0 for r in records]))
 
     plt.figure(figsize=(7, 4))
-    plt.bar(["Positive hit", "CD hit", "Unchanged pred"], [pos_hit_rate, cd_hit_rate, unchanged_rate])
+    plt.bar(["Positive hit", "VCD hit", "Unchanged pred"], [pos_hit_rate, vcd_hit_rate, unchanged_rate])
     plt.ylim(0.0, 1.0)
     plt.ylabel("Rate")
     plt.title("Reject Position Accuracy / Change Rate")
@@ -316,7 +329,7 @@ def _maybe_create_plots(report_dir: Path, records: list[dict[str, Any]]) -> list
     plt.figure(figsize=(7, 4))
     plt.hist(delta_lp, bins=60)
     plt.axvline(0.0, linestyle="--")
-    plt.title("Delta Target LogProb (CD - Positive) at Reject Position")
+    plt.title("Delta Target LogProb (VCD - Positive) at Reject Position")
     plt.xlabel("Delta log-prob")
     plt.ylabel("Count")
     p2 = report_dir / "reject_delta_logprob_hist.png"
@@ -329,8 +342,8 @@ def _maybe_create_plots(report_dir: Path, records: list[dict[str, Any]]) -> list
     plt.figure(figsize=(7, 4))
     plt.hist(delta_rank, bins=60)
     plt.axvline(0.0, linestyle="--")
-    plt.title("Delta Target Rank (Positive - CD) at Reject Position")
-    plt.xlabel("Positive rank - CD rank (higher is better)")
+    plt.title("Delta Target Rank (Positive - VCD) at Reject Position")
+    plt.xlabel("Positive rank - VCD rank (higher is better)")
     plt.ylabel("Count")
     p3 = report_dir / "reject_delta_rank_hist.png"
     plt.tight_layout()
@@ -340,10 +353,10 @@ def _maybe_create_plots(report_dir: Path, records: list[dict[str, Any]]) -> list
 
     conf = np.zeros((2, 2), dtype=np.int64)
     for r in records:
-        conf[int(r["positive_hit"])][int(r["cd_hit"])] += 1
+        conf[int(r["positive_hit"])][int(r["vcd_hit"])] += 1
     plt.figure(figsize=(5, 4))
     plt.imshow(conf, cmap="Blues")
-    plt.xticks([0, 1], ["CD wrong", "CD correct"])
+    plt.xticks([0, 1], ["VCD wrong", "VCD correct"])
     plt.yticks([0, 1], ["Positive wrong", "Positive correct"])
     plt.title("Hit/Hit Confusion at Reject Position")
     for i in range(2):
@@ -383,8 +396,10 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
                 "dataset": args.dataset,
                 "seed": int(args.seed),
                 "block_size": int(block_size),
-                "cd_alpha": float(args.cd_alpha),
-                "cd_beta": float(args.cd_beta),
+                "vcd_alpha": float(args.vcd_alpha),
+                "vcd_beta": float(args.vcd_beta),
+                "evaluation_mode": "positive_rollout_with_vcd_shadow",
+                "vcd_shadow_num_samples": int(args.vcd_shadow_num_samples),
                 "negative_context_dropout": float(args.negative_context_dropout),
                 "negative_context_noise_std": float(args.negative_context_noise_std),
             },
@@ -392,14 +407,20 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
         }
 
     positive_hit = np.asarray([r["positive_hit"] for r in records], dtype=np.float32)
-    cd_hit = np.asarray([r["cd_hit"] for r in records], dtype=np.float32)
+    vcd_hit = np.asarray([r["vcd_hit"] for r in records], dtype=np.float32)
+    vcd_shadow_fix = np.asarray([r["vcd_shadow_fix_hit"] for r in records], dtype=np.float32)
     pred_changed = np.asarray([r["pred_changed"] for r in records], dtype=np.float32)
     delta_lp = np.asarray([r["delta_target_logprob"] for r in records], dtype=np.float32)
     delta_rank = np.asarray([r["delta_target_rank"] for r in records], dtype=np.float32)
     target_in_mask = np.asarray([r["target_in_candidate_mask"] for r in records], dtype=np.float32)
     sampled_in_mask = np.asarray([r["sampled_in_candidate_mask"] for r in records], dtype=np.float32)
-    cd_overwritten = np.asarray([r["cd_overwritten_by_positive"] for r in records], dtype=np.float32)
     sampled_rank_posterior = np.asarray([r["sampled_rank_in_posterior"] for r in records], dtype=np.float32)
+    target_is_posterior_argmax = np.asarray([r["target_is_posterior_argmax"] for r in records], dtype=np.float32)
+    posterior_prefers_target = np.asarray([r["posterior_prefers_target_over_sampled"] for r in records], dtype=np.float32)
+    posterior_gap = np.asarray([r["target_minus_sampled_posterior_logprob"] for r in records], dtype=np.float32)
+    positive_rescue_prob_est = np.asarray([r["positive_rescue_prob_est"] for r in records], dtype=np.float32)
+    vcd_shadow_rescue_prob_est = np.asarray([r["vcd_shadow_rescue_prob_est"] for r in records], dtype=np.float32)
+    rescue_prob_gain = np.asarray([r["rescue_prob_gain_vcd_minus_positive"] for r in records], dtype=np.float32)
     taxonomy_counts: dict[str, int] = {}
     for r in records:
         label = r.get("reject_taxonomy", "unknown")
@@ -411,15 +432,33 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
             "dataset": args.dataset,
             "seed": int(args.seed),
             "block_size": int(block_size),
-            "cd_alpha": float(args.cd_alpha),
-            "cd_beta": float(args.cd_beta),
+            "vcd_alpha": float(args.vcd_alpha),
+            "vcd_beta": float(args.vcd_beta),
+            "evaluation_mode": "positive_rollout_with_vcd_shadow",
+            "vcd_shadow_num_samples": int(args.vcd_shadow_num_samples),
             "negative_context_dropout": float(args.negative_context_dropout),
             "negative_context_noise_std": float(args.negative_context_noise_std),
         },
         "reject_events": int(len(records)),
         "positive_hit_rate": float(positive_hit.mean()),
-        "cd_hit_rate": float(cd_hit.mean()),
-        "hit_rate_gain": float(cd_hit.mean() - positive_hit.mean()),
+        "vcd_hit_rate": float(vcd_hit.mean()),
+        "hit_rate_gain": float(vcd_hit.mean() - positive_hit.mean()),
+        "vcd_shadow_fix_rate": float(vcd_shadow_fix.mean()),
+        "positive_rescue_prob_est": {
+            "mean": float(positive_rescue_prob_est.mean()),
+            "median": float(np.median(positive_rescue_prob_est)),
+        },
+        "vcd_shadow_rescue_prob_est": {
+            "mean": float(vcd_shadow_rescue_prob_est.mean()),
+            "median": float(np.median(vcd_shadow_rescue_prob_est)),
+        },
+        "rescue_prob_gain_vcd_minus_positive": {
+            "mean": float(rescue_prob_gain.mean()),
+            "median": float(np.median(rescue_prob_gain)),
+            "p10": float(np.quantile(rescue_prob_gain, 0.1)),
+            "p90": float(np.quantile(rescue_prob_gain, 0.9)),
+            "improved_rate": float((rescue_prob_gain > 0).mean()),
+        },
         "pred_changed_rate": float(pred_changed.mean()),
         "delta_target_logprob": {
             "mean": float(delta_lp.mean()),
@@ -438,7 +477,14 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
         "reject_cause_indicators": {
             "target_in_candidate_mask_rate": float(target_in_mask.mean()),
             "sampled_in_candidate_mask_rate": float(sampled_in_mask.mean()),
-            "cd_overwritten_by_positive_rate": float(cd_overwritten.mean()),
+            "target_is_posterior_argmax_rate": float(target_is_posterior_argmax.mean()),
+            "posterior_prefers_target_over_sampled_rate": float(posterior_prefers_target.mean()),
+            "target_minus_sampled_posterior_logprob": {
+                "mean": float(posterior_gap.mean()),
+                "median": float(np.median(posterior_gap)),
+                "p10": float(np.quantile(posterior_gap, 0.1)),
+                "p90": float(np.quantile(posterior_gap, 0.9)),
+            },
             "sampled_rank_in_posterior": {
                 "mean": float(sampled_rank_posterior.mean()),
                 "median": float(np.median(sampled_rank_posterior)),
@@ -449,10 +495,10 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
             "taxonomy_rates": taxonomy_rates,
         },
         "confusion": {
-            "positive_wrong_cd_wrong": int(np.sum((positive_hit == 0) & (cd_hit == 0))),
-            "positive_wrong_cd_correct": int(np.sum((positive_hit == 0) & (cd_hit == 1))),
-            "positive_correct_cd_wrong": int(np.sum((positive_hit == 1) & (cd_hit == 0))),
-            "positive_correct_cd_correct": int(np.sum((positive_hit == 1) & (cd_hit == 1))),
+            "positive_wrong_vcd_wrong": int(np.sum((positive_hit == 0) & (vcd_hit == 0))),
+            "positive_wrong_vcd_correct": int(np.sum((positive_hit == 0) & (vcd_hit == 1))),
+            "positive_correct_vcd_wrong": int(np.sum((positive_hit == 1) & (vcd_hit == 0))),
+            "positive_correct_vcd_correct": int(np.sum((positive_hit == 1) & (vcd_hit == 1))),
         },
     }
 
@@ -469,7 +515,7 @@ def _write_report_md(
         return "; ".join([f"{x['text']} ({x['id']}, p={x['prob']:.4f})" for x in items])
 
     lines: list[str] = []
-    lines.append("# Reject Token Analysis: Positive vs CD")
+    lines.append("# Reject Token Analysis: Positive vs VCD")
     lines.append("")
 
     if summary.get("reject_events", 0) == 0:
@@ -480,19 +526,29 @@ def _write_report_md(
     lines.append("## Overall")
     lines.append(f"- Reject events: **{summary['reject_events']}**")
     lines.append(f"- Positive hit rate: **{summary['positive_hit_rate'] * 100:.2f}%**")
-    lines.append(f"- CD hit rate: **{summary['cd_hit_rate'] * 100:.2f}%**")
-    lines.append(f"- Hit-rate gain (CD - Positive): **{summary['hit_rate_gain'] * 100:+.2f}%**")
+    lines.append(f"- VCD hit rate: **{summary['vcd_hit_rate'] * 100:.2f}%**")
+    lines.append(f"- Hit-rate gain (VCD - Positive): **{summary['hit_rate_gain'] * 100:+.2f}%**")
+    lines.append(f"- VCD shadow fix rate @reject: **{summary['vcd_shadow_fix_rate'] * 100:.2f}%**")
+    lines.append(
+        f"- Mean rescue-prob (Positive / VCD-shadow): **{summary['positive_rescue_prob_est']['mean']:.4f} / {summary['vcd_shadow_rescue_prob_est']['mean']:.4f}**"
+    )
+    lines.append(
+        f"- Mean rescue-prob gain (VCD - Positive): **{summary['rescue_prob_gain_vcd_minus_positive']['mean']:+.4f}**"
+    )
+    lines.append(
+        f"- Rescue-prob improved-rate (>0): **{summary['rescue_prob_gain_vcd_minus_positive']['improved_rate'] * 100:.2f}%**"
+    )
     lines.append(f"- Prediction changed rate: **{summary['pred_changed_rate'] * 100:.2f}%**")
     lines.append("")
 
-    lines.append("## Target LogProb Delta (CD - Positive)")
+    lines.append("## Target LogProb Delta (VCD - Positive)")
     lines.append(f"- Mean: {summary['delta_target_logprob']['mean']:.5f}")
     lines.append(f"- Median: {summary['delta_target_logprob']['median']:.5f}")
     lines.append(f"- P10 / P90: {summary['delta_target_logprob']['p10']:.5f} / {summary['delta_target_logprob']['p90']:.5f}")
     lines.append(f"- Improved rate (>0): {summary['delta_target_logprob']['improved_rate'] * 100:.2f}%")
     lines.append("")
 
-    lines.append("## Target Rank Delta (Positive - CD)")
+    lines.append("## Target Rank Delta (Positive - VCD)")
     lines.append(f"- Mean: {summary['delta_target_rank']['mean']:.3f}")
     lines.append(f"- Median: {summary['delta_target_rank']['median']:.3f}")
     lines.append(f"- P10 / P90: {summary['delta_target_rank']['p10']:.3f} / {summary['delta_target_rank']['p90']:.3f}")
@@ -508,10 +564,16 @@ def _write_report_md(
         f"- Sampled token in candidate mask rate: **{rc['sampled_in_candidate_mask_rate'] * 100:.2f}%**"
     )
     lines.append(
-        f"- CD overwritten-by-positive rate (n_keep region): **{rc['cd_overwritten_by_positive_rate'] * 100:.2f}%**"
+        f"- Sampled token rank in posterior (mean/median): **{rc['sampled_rank_in_posterior']['mean']:.2f} / {rc['sampled_rank_in_posterior']['median']:.2f}**"
     )
     lines.append(
-        f"- Sampled token rank in posterior (mean/median): **{rc['sampled_rank_in_posterior']['mean']:.2f} / {rc['sampled_rank_in_posterior']['median']:.2f}**"
+        f"- Target is posterior argmax rate: **{rc['target_is_posterior_argmax_rate'] * 100:.2f}%**"
+    )
+    lines.append(
+        f"- Posterior prefers target over sampled rate: **{rc['posterior_prefers_target_over_sampled_rate'] * 100:.2f}%**"
+    )
+    lines.append(
+        f"- Target minus sampled posterior logprob (mean/median): **{rc['target_minus_sampled_posterior_logprob']['mean']:.4f} / {rc['target_minus_sampled_posterior_logprob']['median']:.4f}**"
     )
     lines.append("")
 
@@ -524,14 +586,14 @@ def _write_report_md(
         lines.append(f"| {key} | {taxonomy_counts[key]} | {taxonomy_rates.get(key, 0.0) * 100:.2f}% |")
     lines.append("")
 
-    lines.append("## Confusion (Positive Hit vs CD Hit)")
-    lines.append("| Positive\\CD | CD wrong | CD correct |")
+    lines.append("## Confusion (Positive Hit vs VCD Hit)")
+    lines.append("| Positive\\VCD | VCD wrong | VCD correct |")
     lines.append("|---|---:|---:|")
     lines.append(
-        f"| Positive wrong | {summary['confusion']['positive_wrong_cd_wrong']} | {summary['confusion']['positive_wrong_cd_correct']} |"
+        f"| Positive wrong | {summary['confusion']['positive_wrong_vcd_wrong']} | {summary['confusion']['positive_wrong_vcd_correct']} |"
     )
     lines.append(
-        f"| Positive correct | {summary['confusion']['positive_correct_cd_wrong']} | {summary['confusion']['positive_correct_cd_correct']} |"
+        f"| Positive correct | {summary['confusion']['positive_correct_vcd_wrong']} | {summary['confusion']['positive_correct_vcd_correct']} |"
     )
     lines.append("")
 
@@ -542,27 +604,27 @@ def _write_report_md(
         lines.append("")
 
     lines.append("## Top Improved Reject Events")
-    lines.append("| sample | turn | step | abs_pos | taxonomy | target | sampled_draft | positive_pred | cd_pred | d_logprob | d_rank | why_reject |")
+    lines.append("| sample | turn | step | abs_pos | taxonomy | target | sampled_draft | positive_pred | vcd_pred | d_logprob | d_rank | why_reject |")
     lines.append("|---:|---:|---:|---:|---|---|---|---|---|---:|---:|---|")
     improved = sorted(records, key=lambda x: x["delta_target_logprob"], reverse=True)[:max_rows]
     for rec in improved:
         lines.append(
             "| {sample_idx} | {turn_idx} | {decode_step} | {absolute_position} | {reject_taxonomy} | {target_token_text} ({target_token_id}) "
             "| {sampled_draft_text} ({sampled_draft_id}) "
-            "| {positive_pred_text} ({positive_pred_id}) | {cd_pred_text} ({cd_pred_id}) "
+            "| {positive_pred_text} ({positive_pred_id}) | {vcd_pred_text} ({vcd_pred_id}) "
             "| {delta_target_logprob:.4f} | {delta_target_rank} | {reject_reason} |".format(**rec)
         )
     lines.append("")
 
     lines.append("## Top Worsened Reject Events")
-    lines.append("| sample | turn | step | abs_pos | taxonomy | target | sampled_draft | positive_pred | cd_pred | d_logprob | d_rank | why_reject |")
+    lines.append("| sample | turn | step | abs_pos | taxonomy | target | sampled_draft | positive_pred | vcd_pred | d_logprob | d_rank | why_reject |")
     lines.append("|---:|---:|---:|---:|---|---|---|---|---|---:|---:|---|")
     worsened = sorted(records, key=lambda x: x["delta_target_logprob"])[:max_rows]
     for rec in worsened:
         lines.append(
             "| {sample_idx} | {turn_idx} | {decode_step} | {absolute_position} | {reject_taxonomy} | {target_token_text} ({target_token_id}) "
             "| {sampled_draft_text} ({sampled_draft_id}) "
-            "| {positive_pred_text} ({positive_pred_id}) | {cd_pred_text} ({cd_pred_id}) "
+            "| {positive_pred_text} ({positive_pred_id}) | {vcd_pred_text} ({vcd_pred_id}) "
             "| {delta_target_logprob:.4f} | {delta_target_rank} | {reject_reason} |".format(**rec)
         )
 
@@ -578,17 +640,17 @@ def _write_report_md(
             f"- Proposed draft token: `{rec['sampled_draft_text']}` ({rec['sampled_draft_id']}); posterior token: `{rec['target_token_text']}` ({rec['target_token_id']})"
         )
         lines.append(
-            f"- Positive pred: `{rec['positive_pred_text']}` ({rec['positive_pred_id']}), CD pred: `{rec['cd_pred_text']}` ({rec['cd_pred_id']})"
+            f"- Positive pred: `{rec['positive_pred_text']}` ({rec['positive_pred_id']}), VCD pred: `{rec['vcd_pred_text']}` ({rec['vcd_pred_id']})"
         )
         lines.append(f"- Reason: {rec['reject_reason']}")
         lines.append(
-            f"- Candidate mask: target_in={rec['target_in_candidate_mask']}, sampled_in={rec['sampled_in_candidate_mask']}, cd_overwritten={rec['cd_overwritten_by_positive']}"
+            f"- Candidate mask: target_in={rec['target_in_candidate_mask']}, sampled_in={rec['sampled_in_candidate_mask']}"
         )
         lines.append(
             f"- Delta target logprob/rank: {rec['delta_target_logprob']:.4f} / {rec['delta_target_rank']}"
         )
         lines.append(f"- Positive top-3: {_fmt_topk(rec['positive_top5'], 3)}")
-        lines.append(f"- CD top-3: {_fmt_topk(rec['cd_top5'], 3)}")
+        lines.append(f"- VCD top-3: {_fmt_topk(rec['vcd_top5'], 3)}")
         lines.append(f"- Posterior top-3: {_fmt_topk(rec['posterior_top5'], 3)}")
         lines.append("")
 
@@ -606,12 +668,13 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
-    cd_alpha: float = 1.0,
+    vcd_alpha: float = 1.0,
     beta: float = 0.1,
     negative_context_dropout: float = 0.3,
     negative_context_noise_std: float = 0.0,
     divergence_accumulator: Optional[List[float]] = None,
     reject_records: Optional[list[dict[str, Any]]] = None,
+    vcd_shadow_num_samples: int = 1,
     sample_idx: int = -1,
     turn_idx: int = -1,
     seed: int = 0,
@@ -672,18 +735,18 @@ def dflash_generate(
             if divergence_accumulator is not None:
                 divergence_accumulator.append(_compute_kl_divergence(positive_draft_logits, negative_draft_logits))
 
-            candidate_mask = build_cd_candidate_mask(reference_logits=positive_draft_logits, beta=beta)
-            final_draft_logits = apply_cd_logits(
+            candidate_mask = build_vcd_candidate_mask(reference_logits=positive_draft_logits, beta=beta)
+            final_draft_logits = apply_vcd_logits(
                 first_logits=positive_draft_logits,
                 second_logits=negative_draft_logits,
-                alpha=cd_alpha,
+                alpha=vcd_alpha,
             )
-            final_draft_logits = apply_cd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
+            final_draft_logits = apply_vcd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
+            positive_sampled_tokens = sample(positive_draft_logits, gen=gen)
+            vcd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)
 
-            n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
-
-            block_output_ids[:, 1:] = sample(final_draft_logits, gen=gen)
+            # Keep original rollout trajectory; VCD is evaluated in shadow mode.
+            block_output_ids[:, 1:] = positive_sampled_tokens
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -703,29 +766,47 @@ def dflash_generate(
             reject_offset = acceptance_length
             target_token_id = int(posterior[0, reject_offset].item())
             sampled_draft_id = int(block_output_ids[0, reject_offset + 1].item())
-            n_keep = min(6, final_draft_logits.size(1))
+            vcd_shadow_sampled_id = int(vcd_shadow_sampled_tokens[0, reject_offset].item())
 
             positive_step_logits = positive_draft_logits[0, reject_offset, :].float()
-            cd_step_logits = final_draft_logits[0, reject_offset, :].float()
+            vcd_step_logits = final_draft_logits[0, reject_offset, :].float()
             posterior_step_logits = output.logits[0, reject_offset, :].float()
 
             positive_pred_id = int(torch.argmax(positive_step_logits).item())
-            cd_pred_id = int(torch.argmax(cd_step_logits).item())
+            vcd_pred_id = int(torch.argmax(vcd_step_logits).item())
             posterior_pred_id = int(torch.argmax(posterior_step_logits).item())
 
             positive_logprob = torch.log_softmax(positive_step_logits, dim=-1)
-            cd_logprob = torch.log_softmax(cd_step_logits, dim=-1)
+            vcd_logprob = torch.log_softmax(vcd_step_logits, dim=-1)
             posterior_logprob = torch.log_softmax(posterior_step_logits, dim=-1)
 
             pos_target_logprob = float(positive_logprob[target_token_id].item())
-            cd_target_logprob = float(cd_logprob[target_token_id].item())
+            vcd_target_logprob = float(vcd_logprob[target_token_id].item())
             posterior_target_logprob = float(posterior_logprob[target_token_id].item())
+            posterior_sampled_logprob = float(posterior_logprob[sampled_draft_id].item())
+            posterior_vcd_shadow_sampled_logprob = float(posterior_logprob[vcd_shadow_sampled_id].item())
+            positive_sampled_logprob = float(positive_logprob[sampled_draft_id].item())
+            vcd_sampled_logprob = float(vcd_logprob[sampled_draft_id].item())
 
             pos_rank = _token_rank_from_logits(positive_step_logits, target_token_id)
-            cd_rank = _token_rank_from_logits(cd_step_logits, target_token_id)
+            vcd_rank = _token_rank_from_logits(vcd_step_logits, target_token_id)
             sampled_rank_posterior = _token_rank_from_logits(posterior_step_logits, sampled_draft_id)
+            vcd_shadow_sampled_rank_posterior = _token_rank_from_logits(posterior_step_logits, vcd_shadow_sampled_id)
             target_in_candidate_mask = int(candidate_mask[0, reject_offset, target_token_id].item())
             sampled_in_candidate_mask = int(candidate_mask[0, reject_offset, sampled_draft_id].item())
+            vcd_shadow_sampled_in_candidate_mask = int(candidate_mask[0, reject_offset, vcd_shadow_sampled_id].item())
+            positive_rescue_prob_est = _estimate_token_hit_probability(
+                positive_step_logits,
+                target_token_id,
+                num_samples=vcd_shadow_num_samples,
+                gen=gen,
+            )
+            vcd_shadow_rescue_prob_est = _estimate_token_hit_probability(
+                vcd_step_logits,
+                target_token_id,
+                num_samples=vcd_shadow_num_samples,
+                gen=gen,
+            )
 
             record = {
                 "sample_idx": int(sample_idx),
@@ -737,28 +818,43 @@ def dflash_generate(
                 "target_token_text": _token_str(tokenizer, target_token_id),
                 "sampled_draft_id": int(sampled_draft_id),
                 "sampled_draft_text": _token_str(tokenizer, sampled_draft_id),
+                "vcd_shadow_sampled_id": int(vcd_shadow_sampled_id),
+                "vcd_shadow_sampled_text": _token_str(tokenizer, vcd_shadow_sampled_id),
                 "positive_pred_id": int(positive_pred_id),
                 "positive_pred_text": _token_str(tokenizer, positive_pred_id),
-                "cd_pred_id": int(cd_pred_id),
-                "cd_pred_text": _token_str(tokenizer, cd_pred_id),
+                "vcd_pred_id": int(vcd_pred_id),
+                "vcd_pred_text": _token_str(tokenizer, vcd_pred_id),
                 "posterior_pred_id": int(posterior_pred_id),
                 "posterior_pred_text": _token_str(tokenizer, posterior_pred_id),
                 "positive_hit": int(positive_pred_id == target_token_id),
-                "cd_hit": int(cd_pred_id == target_token_id),
-                "pred_changed": int(cd_pred_id != positive_pred_id),
+                "vcd_hit": int(vcd_pred_id == target_token_id),
+                "pred_changed": int(vcd_pred_id != positive_pred_id),
                 "positive_target_logprob": float(pos_target_logprob),
-                "cd_target_logprob": float(cd_target_logprob),
+                "vcd_target_logprob": float(vcd_target_logprob),
                 "posterior_target_logprob": float(posterior_target_logprob),
-                "delta_target_logprob": float(cd_target_logprob - pos_target_logprob),
+                "posterior_sampled_logprob": float(posterior_sampled_logprob),
+                "posterior_vcd_shadow_sampled_logprob": float(posterior_vcd_shadow_sampled_logprob),
+                "positive_sampled_logprob": float(positive_sampled_logprob),
+                "vcd_sampled_logprob": float(vcd_sampled_logprob),
+                "delta_target_logprob": float(vcd_target_logprob - pos_target_logprob),
+                "target_minus_sampled_posterior_logprob": float(posterior_target_logprob - posterior_sampled_logprob),
+                "target_minus_vcd_shadow_sampled_posterior_logprob": float(posterior_target_logprob - posterior_vcd_shadow_sampled_logprob),
                 "positive_target_rank": int(pos_rank),
-                "cd_target_rank": int(cd_rank),
-                "delta_target_rank": int(pos_rank - cd_rank),
+                "vcd_target_rank": int(vcd_rank),
+                "delta_target_rank": int(pos_rank - vcd_rank),
                 "sampled_rank_in_posterior": int(sampled_rank_posterior),
+                "vcd_shadow_sampled_rank_in_posterior": int(vcd_shadow_sampled_rank_posterior),
+                "target_is_posterior_argmax": int(target_token_id == posterior_pred_id),
+                "posterior_prefers_target_over_sampled": int(posterior_target_logprob > posterior_sampled_logprob),
                 "target_in_candidate_mask": int(target_in_candidate_mask),
                 "sampled_in_candidate_mask": int(sampled_in_candidate_mask),
-                "cd_overwritten_by_positive": int(reject_offset < n_keep),
+                "vcd_shadow_sampled_in_candidate_mask": int(vcd_shadow_sampled_in_candidate_mask),
+                "vcd_shadow_fix_hit": int(vcd_shadow_sampled_id == target_token_id),
+                "positive_rescue_prob_est": float(positive_rescue_prob_est),
+                "vcd_shadow_rescue_prob_est": float(vcd_shadow_rescue_prob_est),
+                "rescue_prob_gain_vcd_minus_positive": float(vcd_shadow_rescue_prob_est - positive_rescue_prob_est),
                 "positive_top5": _topk_token_details(positive_step_logits, tokenizer, k=5),
-                "cd_top5": _topk_token_details(cd_step_logits, tokenizer, k=5),
+                "vcd_top5": _topk_token_details(vcd_step_logits, tokenizer, k=5),
                 "posterior_top5": _topk_token_details(posterior_step_logits, tokenizer, k=5),
             }
             record["reject_reason"] = _build_reject_reason(record)
@@ -815,10 +911,16 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", type=float, default=0.1)
-    parser.add_argument("--cd-beta", type=float, default=0.1)
+    parser.add_argument("--vcd-alpha", type=float, default=0.5)
+    parser.add_argument("--vcd-beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
+    parser.add_argument(
+        "--vcd-shadow-num-samples",
+        type=int,
+        default=1,
+        help="Number of Monte Carlo samples per reject position to estimate rescue probability.",
+    )
     parser.add_argument("--max-example-rows", type=int, default=30)
     parser.add_argument("--report-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
@@ -906,12 +1008,13 @@ def main() -> None:
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
-                    cd_alpha=args.cd_alpha,
-                    beta=args.cd_beta,
+                    vcd_alpha=args.vcd_alpha,
+                    beta=args.vcd_beta,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
                     divergence_accumulator=divergence_accumulator if bs == block_size else None,
                     reject_records=reject_records if bs == block_size else None,
+                    vcd_shadow_num_samples=args.vcd_shadow_num_samples,
                     sample_idx=idx,
                     turn_idx=turn_index,
                     seed=sample_seed + bs,
@@ -971,8 +1074,17 @@ def main() -> None:
     print(f"Reject events recorded: {summary.get('reject_events', 0)}")
     if summary.get("reject_events", 0) > 0:
         print(f"Positive hit rate @reject: {summary['positive_hit_rate'] * 100:.2f}%")
-        print(f"CD hit rate @reject: {summary['cd_hit_rate'] * 100:.2f}%")
-        print(f"Hit-rate gain (CD - Positive): {summary['hit_rate_gain'] * 100:+.2f}%")
+        print(f"VCD hit rate @reject: {summary['vcd_hit_rate'] * 100:.2f}%")
+        print(f"Hit-rate gain (VCD - Positive): {summary['hit_rate_gain'] * 100:+.2f}%")
+        print(f"VCD shadow fix rate @reject: {summary['vcd_shadow_fix_rate'] * 100:.2f}%")
+        print(
+            "Mean rescue-prob (Positive / VCD-shadow): "
+            f"{summary['positive_rescue_prob_est']['mean']:.4f} / {summary['vcd_shadow_rescue_prob_est']['mean']:.4f}"
+        )
+        print(
+            "Mean rescue-prob gain (VCD - Positive): "
+            f"{summary['rescue_prob_gain_vcd_minus_positive']['mean']:+.4f}"
+        )
     print(f"Report directory: {report_dir}")
     print(f"  - {jsonl_path.name}")
     print(f"  - {csv_path.name}")
