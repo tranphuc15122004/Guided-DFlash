@@ -14,8 +14,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
 
-NEGATIVE_HIDDEN_MODE = 'shuffle_tokens' 
-
 """ 
 Contrastive decoding with CD candidate filtering and enhanced negative sampling for the draft model.
 Key features:
@@ -49,47 +47,72 @@ def set_global_seed(seed: int, deterministic: bool = True) -> None:
         torch.use_deterministic_algorithms(False)
         torch.backends.cudnn.benchmark = True
 
-# construct negative sample by randomly replacing the batch's first token (target model generated token) 
-def build_negative_block_output_random(block_output_ids: torch.Tensor, vocab_size: int , gen : torch.Generator = None) -> torch.Tensor:
+
+def load_token_neighbor_table(
+    table_path: Optional[str],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if table_path is None:
+        return None
+    neighbor_np = np.load(table_path, mmap_mode="r")
+    if neighbor_np.ndim != 2:
+        raise ValueError(f"Neighbor table must be 2D [vocab_size, top_k], got shape {neighbor_np.shape}")
+    neighbor_table = torch.as_tensor(np.asarray(neighbor_np, dtype=np.int64), device=device)
+    return neighbor_table
+
+
+# Construct negative sample by replacing the first token with an embedding-neighbor token.
+# Falls back to random replacement when neighbor table is not provided.
+def build_negative_block_output_neighbor(
+    block_output_ids: torch.Tensor,
+    vocab_size: int,
+    token_neighbor_table: Optional[torch.Tensor],
+    neighbor_topk: int,
+    gen: torch.Generator = None,
+) -> torch.Tensor:
     negative_block_output_ids = block_output_ids.clone()
     batch_size = block_output_ids.shape[0]
-    random_tokens = torch.randint(0, vocab_size, (batch_size,), device=block_output_ids.device , generator=gen)
-    negative_block_output_ids[:, 0] = random_tokens
+
+    if token_neighbor_table is None:
+        random_tokens = torch.randint(0, vocab_size, (batch_size,), device=block_output_ids.device, generator=gen)
+        negative_block_output_ids[:, 0] = random_tokens
+        return negative_block_output_ids
+
+    source_tokens = block_output_ids[:, 0]
+    neighbor_candidates = token_neighbor_table.index_select(0, source_tokens)
+    topk = min(max(1, neighbor_topk), neighbor_candidates.shape[1])
+    neighbor_candidates = neighbor_candidates[:, :topk]
+
+    if topk == 1:
+        replacement_tokens = neighbor_candidates[:, 0]
+    else:
+        sampled_col = torch.randint(0, topk, (batch_size,), device=block_output_ids.device, generator=gen)
+        replacement_tokens = neighbor_candidates.gather(1, sampled_col.unsqueeze(1)).squeeze(1)
+
+    same_token_mask = replacement_tokens == source_tokens
+    if same_token_mask.any():
+        replacement_tokens[same_token_mask] = (replacement_tokens[same_token_mask] + 1) % vocab_size
+
+    negative_block_output_ids[:, 0] = replacement_tokens
     return negative_block_output_ids
 
 def build_negative_target_hidden(
     target_hidden: torch.Tensor,
     dropout_ratio: float = 0.3,
     noise_std: float = 0.0,
-    mode: str = "mask_zero",
     gen : torch.Generator = None,
 ) -> torch.Tensor:
     negative_target_hidden = target_hidden.clone()
-    batch_size, context_len = negative_target_hidden.shape[:2]
 
-    if mode == "mask_zero":
-        if dropout_ratio > 0.0:
-            token_keep_mask = (
-                torch.rand(
-                    negative_target_hidden.shape[:2],
-                    device=negative_target_hidden.device,
-                    generator=gen
-                ) >= dropout_ratio
-            ).unsqueeze(-1)
-            negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
-    elif mode == "shuffle_tokens":
-        if context_len > 1:
-            per_batch_indices = []
-            for _ in range(batch_size):
-                perm = torch.randperm(context_len, device=negative_target_hidden.device, generator=gen)
-                per_batch_indices.append(perm)
-            gather_index = torch.stack(per_batch_indices, dim=0).unsqueeze(-1).expand(-1, -1, negative_target_hidden.shape[-1])
-            negative_target_hidden = torch.gather(negative_target_hidden, dim=1, index=gather_index)
-    else:
-        raise ValueError(
-            f"Unsupported negative hidden mode: {mode}. "
-            "Use 'mask_zero' or 'shuffle_tokens'."
-        )
+    if dropout_ratio > 0.0:
+        token_keep_mask = (
+            torch.rand(
+                negative_target_hidden.shape[:2],
+                device=negative_target_hidden.device,
+                generator=gen
+            ) >= dropout_ratio
+        ).unsqueeze(-1)
+        negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
 
     if noise_std > 0.0:
         noise = torch.randn(
@@ -112,17 +135,23 @@ def compute_contrastive_draft_logits(
     block_size: int,
     negative_context_dropout: float,
     negative_context_noise_std: float,
-    negative_hidden_mode: str,
+    token_neighbor_table: Optional[torch.Tensor],
+    neighbor_topk: int,
     gen : torch.Generator = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = block_output_ids.shape[0]
     
-    neg_block_output_ids = build_negative_block_output_random(block_output_ids, target.config.vocab_size , gen)
+    neg_block_output_ids = build_negative_block_output_neighbor(
+        block_output_ids=block_output_ids,
+        vocab_size=target.config.vocab_size,
+        token_neighbor_table=token_neighbor_table,
+        neighbor_topk=neighbor_topk,
+        gen=gen,
+    )
     negative_target_hidden = build_negative_target_hidden(
         target_hidden=target_hidden,
         dropout_ratio=negative_context_dropout,
         noise_std=negative_context_noise_std,
-        mode=negative_hidden_mode,
         gen=gen,
     )
     
@@ -224,7 +253,8 @@ def dflash_generate(
     beta: float = 0.1,
     negative_context_dropout: float = 0.3,
     negative_context_noise_std: float = 0.0,
-    negative_hidden_mode: str = "mask_zero",
+    token_neighbor_table: Optional[torch.Tensor] = None,
+    negative_token_neighbor_topk: int = 1,
     divergence_accumulator: Optional[List[float]] = None,
     seed: int = 0,
 ) -> SimpleNamespace:
@@ -283,7 +313,8 @@ def dflash_generate(
                 block_size=block_size,
                 negative_context_dropout=negative_context_dropout,
                 negative_context_noise_std=negative_context_noise_std,
-                negative_hidden_mode=negative_hidden_mode,
+                token_neighbor_table=token_neighbor_table,
+                neighbor_topk=negative_token_neighbor_topk,
                 gen=gen
             )
             past_key_values_draft.crop(start)
@@ -365,7 +396,6 @@ def dflash_generate(
 
 
 def main() -> None:
-    global NEGATIVE_HIDDEN_MODE
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
@@ -379,11 +409,16 @@ def main() -> None:
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
-        "--negative-hidden-mode",
+        "--negative-token-neighbor-table",
         type=str,
-        choices=["mask_zero", "shuffle_tokens"],
-        default=NEGATIVE_HIDDEN_MODE,
-        help="How to construct negative hidden: mask tokens to zero or shuffle token positions.",
+        default=None,
+        help="Path to precomputed token-neighbor table (.npy) with shape [vocab_size, top_k].",
+    )
+    parser.add_argument(
+        "--negative-token-neighbor-topk",
+        type=int,
+        default=1,
+        help="Sample replacement token from top-k nearest neighbors (1 = deterministic nearest).",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -393,7 +428,6 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
-    NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -419,6 +453,19 @@ def main() -> None:
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
         dtype=torch.bfloat16,
     ).to(device).eval()
+
+    token_neighbor_table = load_token_neighbor_table(args.negative_token_neighbor_table, device=device)
+    if token_neighbor_table is not None:
+        if token_neighbor_table.shape[0] != target.config.vocab_size:
+            raise ValueError(
+                f"Neighbor table vocab size mismatch: table has {token_neighbor_table.shape[0]}, "
+                f"target model expects {target.config.vocab_size}."
+            )
+        logger.info(
+            f"Loaded token neighbor table {args.negative_token_neighbor_table} with shape {tuple(token_neighbor_table.shape)}"
+        )
+    else:
+        logger.warning("No neighbor table provided. Falling back to random token replacement for negative samples.")
 
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
@@ -464,7 +511,8 @@ def main() -> None:
                     beta=args.cd_beta,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
-                    negative_hidden_mode=args.negative_hidden_mode,
+                    token_neighbor_table=token_neighbor_table,
+                    negative_token_neighbor_topk=args.negative_token_neighbor_topk,
                     divergence_accumulator = divergence_accumulator,
                     seed = sample_seed + bs,
                 )
