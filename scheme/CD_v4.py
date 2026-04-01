@@ -411,7 +411,7 @@ def main() -> None:
     parser.add_argument(
         "--negative-token-neighbor-table",
         type=str,
-        default=None,
+        default='assets/qwen3_4b_token_neighbors_top32_far.npy',
         help="Path to precomputed token-neighbor table (.npy) with shape [vocab_size, top_k].",
     )
     parser.add_argument(

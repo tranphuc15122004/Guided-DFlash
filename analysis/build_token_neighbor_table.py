@@ -20,6 +20,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument(
+        "--neighbor-mode",
+        type=str,
+        choices=["nearest", "farthest"],
+        default="nearest",
+        help="Build top-k nearest or top-k farthest token neighbors by cosine similarity.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -77,17 +84,25 @@ def main() -> None:
         # Cosine similarity because embeddings are L2-normalized.
         sim = query @ embedding.T  # [chunk, vocab]
 
-        # Exclude self-token from nearest-neighbor candidates.
+        # Exclude self-token from candidates.
         row_idx = torch.arange(end - start, device=device)
         col_idx = torch.arange(start, end, device=device)
-        sim[row_idx, col_idx] = -torch.inf
+        if args.neighbor_mode == "nearest":
+            sim[row_idx, col_idx] = -torch.inf
+            largest = True
+        else:
+            sim[row_idx, col_idx] = torch.inf
+            largest = False
 
-        _, top_idx = torch.topk(sim, k=args.top_k, dim=-1, largest=True, sorted=True)
+        _, top_idx = torch.topk(sim, k=args.top_k, dim=-1, largest=largest, sorted=True)
         neighbor_table[start:end] = top_idx.to(torch.int32).cpu().numpy()
 
     np.save(output_path, neighbor_table)
     print(f"Saved neighbor table to {output_path} with shape {neighbor_table.shape}")
-    print(f"vocab_size={vocab_size}, hidden_dim={hidden_dim}, top_k={args.top_k}")
+    print(
+        f"vocab_size={vocab_size}, hidden_dim={hidden_dim}, "
+        f"top_k={args.top_k}, neighbor_mode={args.neighbor_mode}"
+    )
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ for task in "${TASKS[@]}"; do
   torchrun \
     --nproc_per_node=1 \
     --master_port=29600 \
-    -m Analysis.check_reject_tok \
+    -m scheme.CD_v4 \
     --dataset "$DATASET_NAME" \
     --max-samples "$MAX_SAMPLES" \
     --model-name-or-path Qwen/Qwen3-4B \

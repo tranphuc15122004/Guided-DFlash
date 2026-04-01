@@ -476,10 +476,19 @@ def main() -> None:
     set_global_seed(args.seed, deterministic=args.deterministic)
 
     dist.init()
-    torch.cuda.set_device(dist.local_rank())
-    device = torch.device(f"cuda:{dist.local_rank()}")
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(dist.local_rank())
+        device = torch.device(f"cuda:{dist.local_rank()}")
+        model_dtype = torch.bfloat16
+    else:
+        logger.warning("CUDA is unavailable. Falling back to CPU inference; this benchmark will run much slower.")
+        device = torch.device("cpu")
+        model_dtype = torch.float32
 
     def has_flash_attn():
+        if not use_cuda:
+            return False
         if args.deterministic:
             logger.info("Deterministic mode enabled. Forcing SDPA attention backend.")
             return False
@@ -495,13 +504,13 @@ def main() -> None:
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
     ).to(device).eval()
 
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
     ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size

@@ -1,6 +1,7 @@
 import os
 import warnings
 from typing import Any, List, Optional
+import torch
 from torch import distributed as dist
 __all__ = [
     "init",
@@ -18,7 +19,8 @@ def init() -> None:
     if "RANK" not in os.environ:
         warnings.warn("Environment variable `RANK` is not set. Skipping distributed initialization.")
         return
-    dist.init_process_group(backend="nccl", init_method="env://")
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
 
 
 def is_initialized() -> bool:
