@@ -1,0 +1,85 @@
+{
+  "meta": {
+    "dataset": "gsm8k",
+    "seed": 0,
+    "block_size": 16,
+    "vcd_alpha": 0.1,
+    "vcd_beta": 0.1,
+    "evaluation_mode": "positive_rollout_with_contrastive_shadow",
+    "vcd_shadow_num_samples": 1,
+    "negative_context_dropout": 0.3,
+    "negative_context_noise_std": 0.0,
+    "compare_name": "CDv4"
+  },
+  "reject_events": 5491,
+  "positive_hit_rate": 0.011837552301585674,
+  "vcd_hit_rate": 0.0,
+  "hit_rate_gain": -0.011837552301585674,
+  "vcd_shadow_fix_rate": 0.0,
+  "positive_rescue_prob_est": {
+    "mean": 0.16099071502685547,
+    "median": 0.0
+  },
+  "vcd_shadow_rescue_prob_est": {
+    "mean": 0.1615370661020279,
+    "median": 0.0
+  },
+  "rescue_prob_gain_vcd_minus_positive": {
+    "mean": 0.000546348572243005,
+    "median": 0.0,
+    "p10": -1.0,
+    "p90": 1.0,
+    "improved_rate": 0.12001456929521034
+  },
+  "pred_changed_rate": 0.022946640849113464,
+  "delta_target_logprob": {
+    "mean": -Infinity,
+    "median": 0.0,
+    "p10": -3.3895313892515355e+38,
+    "p90": 0.1075512170791626,
+    "improved_rate": 0.14350755782189037
+  },
+  "delta_target_rank": {
+    "mean": 6.2434892654418945,
+    "median": 0.0,
+    "p10": 0.0,
+    "p90": 0.0,
+    "improved_rate": 0.0877800036423238
+  },
+  "reject_cause_indicators": {
+    "target_in_candidate_mask_rate": 0.6765616536140442,
+    "sampled_in_candidate_mask_rate": 1.0,
+    "target_is_posterior_argmax_rate": 1.0,
+    "posterior_prefers_target_over_sampled_rate": 0.9841558933258057,
+    "target_minus_sampled_posterior_logprob": {
+      "mean": 13.961767196655273,
+      "median": 7.125,
+      "p10": 0.625,
+      "p90": 35.25
+    },
+    "sampled_rank_in_posterior": {
+      "mean": 2038.2052001953125,
+      "median": 3.0,
+      "p10": 2.0,
+      "p90": 1179.0
+    },
+    "taxonomy_counts": {
+      "target_filtered_by_candidate_mask": 1776,
+      "vcd_shifted_but_still_wrong": 38,
+      "no_vcd_effect_positive_wrong": 3612,
+      "vcd_regression_from_positive": 65
+    },
+    "taxonomy_rates": {
+      "target_filtered_by_candidate_mask": 0.32343835366964124,
+      "vcd_shifted_but_still_wrong": 0.006920415224913495,
+      "no_vcd_effect_positive_wrong": 0.6578036787470406,
+      "vcd_regression_from_positive": 0.011837552358404663
+    }
+  },
+  "confusion": {
+    "positive_wrong_vcd_wrong": 5426,
+    "positive_wrong_vcd_correct": 0,
+    "positive_correct_vcd_wrong": 65,
+    "positive_correct_vcd_correct": 0
+  }
+}

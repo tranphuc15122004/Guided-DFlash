@@ -2,15 +2,18 @@ import argparse
 import os
 import time
 import random
+import json
 from itertools import chain
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, List, Optional
 from loguru import logger
 import numpy as np
 import torch
 from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from analysis import token_level_core
+from analysis import token_level_reporting
 from model import *
 import distributed as dist
 
@@ -70,31 +73,13 @@ def build_negative_block_output_neighbor(
     neighbor_topk: int,
     gen: torch.Generator = None,
 ) -> torch.Tensor:
-    negative_block_output_ids = block_output_ids.clone()
-    batch_size = block_output_ids.shape[0]
-
-    if token_neighbor_table is None:
-        random_tokens = torch.randint(0, vocab_size, (batch_size,), device=block_output_ids.device, generator=gen)
-        negative_block_output_ids[:, 0] = random_tokens
-        return negative_block_output_ids
-
-    source_tokens = block_output_ids[:, 0]
-    neighbor_candidates = token_neighbor_table.index_select(0, source_tokens)
-    topk = min(max(1, neighbor_topk), neighbor_candidates.shape[1])
-    neighbor_candidates = neighbor_candidates[:, :topk]
-
-    if topk == 1:
-        replacement_tokens = neighbor_candidates[:, 0]
-    else:
-        sampled_col = torch.randint(0, topk, (batch_size,), device=block_output_ids.device, generator=gen)
-        replacement_tokens = neighbor_candidates.gather(1, sampled_col.unsqueeze(1)).squeeze(1)
-
-    same_token_mask = replacement_tokens == source_tokens
-    if same_token_mask.any():
-        replacement_tokens[same_token_mask] = (replacement_tokens[same_token_mask] + 1) % vocab_size
-
-    negative_block_output_ids[:, 0] = replacement_tokens
-    return negative_block_output_ids
+    return token_level_core.build_negative_block_output_neighbor(
+        block_output_ids=block_output_ids,
+        vocab_size=vocab_size,
+        token_neighbor_table=token_neighbor_table,
+        neighbor_topk=neighbor_topk,
+        gen=gen,
+    )
 
 def build_negative_target_hidden(
     target_hidden: torch.Tensor,
@@ -102,28 +87,12 @@ def build_negative_target_hidden(
     noise_std: float = 0.0,
     gen : torch.Generator = None,
 ) -> torch.Tensor:
-    negative_target_hidden = target_hidden.clone()
-
-    if dropout_ratio > 0.0:
-        token_keep_mask = (
-            torch.rand(
-                negative_target_hidden.shape[:2],
-                device=negative_target_hidden.device,
-                generator=gen
-            ) >= dropout_ratio
-        ).unsqueeze(-1)
-        negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
-
-    if noise_std > 0.0:
-        noise = torch.randn(
-            negative_target_hidden.shape,
-            dtype=negative_target_hidden.dtype,
-            device=negative_target_hidden.device,
-            generator=gen
-        )
-        negative_target_hidden = negative_target_hidden + noise_std * noise
-
-    return negative_target_hidden
+    return token_level_core.build_negative_target_hidden(
+        target_hidden=target_hidden,
+        dropout_ratio=dropout_ratio,
+        noise_std=noise_std,
+        gen=gen,
+    )
 
 def compute_contrastive_draft_logits(
     model: DFlashDraftModel,
@@ -139,79 +108,52 @@ def compute_contrastive_draft_logits(
     neighbor_topk: int,
     gen : torch.Generator = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size = block_output_ids.shape[0]
-    
-    neg_block_output_ids = build_negative_block_output_neighbor(
+    def _neighbor_builder(
+        inner_block_output_ids: torch.Tensor,
+        vocab_size: int,
+        inner_gen: Optional[torch.Generator],
+    ) -> torch.Tensor:
+        return token_level_core.build_negative_block_output_neighbor(
+            block_output_ids=inner_block_output_ids,
+            vocab_size=vocab_size,
+            token_neighbor_table=token_neighbor_table,
+            neighbor_topk=neighbor_topk,
+            gen=inner_gen,
+        )
+
+    return token_level_core.compute_contrastive_draft_logits(
+        model=model,
+        target=target,
         block_output_ids=block_output_ids,
-        vocab_size=target.config.vocab_size,
-        token_neighbor_table=token_neighbor_table,
-        neighbor_topk=neighbor_topk,
-        gen=gen,
-    )
-    negative_target_hidden = build_negative_target_hidden(
         target_hidden=target_hidden,
-        dropout_ratio=negative_context_dropout,
-        noise_std=negative_context_noise_std,
+        draft_position_ids=draft_position_ids,
+        past_key_values_draft=past_key_values_draft,
+        block_size=block_size,
+        negative_context_dropout=negative_context_dropout,
+        negative_context_noise_std=negative_context_noise_std,
+        negative_block_builder=_neighbor_builder,
         gen=gen,
     )
-    
-    possitive_noise_embedding = target.model.embed_tokens(block_output_ids)
-    negative_noise_embedding = target.model.embed_tokens(neg_block_output_ids)
-    
-
-    paired_noise_embedding = torch.cat([possitive_noise_embedding, negative_noise_embedding], dim=0)
-    paired_hidden = torch.cat([target_hidden, negative_target_hidden], dim=0)
-    
-    paired_position_ids = torch.cat([draft_position_ids, draft_position_ids], dim=0)
-
-    paired_draft_logits = target.lm_head(model(
-        target_hidden=paired_hidden,
-        noise_embedding=paired_noise_embedding,
-        position_ids=paired_position_ids,
-        past_key_values=past_key_values_draft,
-        use_cache=True,
-        is_causal=False,
-    )[:, -block_size+1:, :])
-
-    first_draft_logits, second_draft_logits = paired_draft_logits.split(batch_size, dim=0)
-    return first_draft_logits, second_draft_logits
 
 
 def build_cd_candidate_mask(
     reference_logits: torch.Tensor,
     beta: float,
 ) -> torch.Tensor:
-    reference_probs = torch.softmax(reference_logits, dim=-1)
-    max_reference_probs = reference_probs.amax(dim=-1, keepdim=True)
-    candidate_mask = reference_probs >= (beta * max_reference_probs)
-
-    top_token_indices = reference_probs.argmax(dim=-1, keepdim=True)
-    candidate_mask.scatter_(-1, top_token_indices, True)
-    return candidate_mask
+    return token_level_core.build_candidate_mask(reference_logits=reference_logits, beta=beta)
 
 
 def apply_cd_candidate_filter(
     logits: torch.Tensor,
     candidate_mask: torch.Tensor,
 ) -> torch.Tensor:
-    filtered_logits = logits.masked_fill(
-        ~candidate_mask,
-        torch.finfo(logits.dtype).min,
-    )
-    return filtered_logits
+    return token_level_core.apply_candidate_filter(logits=logits, candidate_mask=candidate_mask)
 
 def _compute_kl_divergence(
     first_logits: torch.Tensor,
     second_logits: torch.Tensor,
 ) -> float:
-    """
-    Returns a scalar KL(P_first || P_second) averaged over the vocab dimension.
-    """
-    p_first = torch.softmax(first_logits, dim=-1)
-    p_second = torch.softmax(second_logits, dim=-1)
-    # Add a tiny epsilon to avoid log(0)
-    kl = (p_first * (torch.log(p_first + 1e-10) - torch.log(p_second + 1e-10))).sum(dim=-1).mean()
-    return kl.item()
+    return token_level_core.compute_kl_divergence(first_logits=first_logits, second_logits=second_logits)
 
 def log_logits_difference(
     first_logits: torch.Tensor,
@@ -243,6 +185,7 @@ def log_logits_difference(
 def dflash_generate(
     model: DFlashDraftModel,
     target: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
     input_ids: torch.Tensor,
     mask_token_id: int,
     max_new_tokens: int,
@@ -256,6 +199,10 @@ def dflash_generate(
     token_neighbor_table: Optional[torch.Tensor] = None,
     negative_token_neighbor_topk: int = 1,
     divergence_accumulator: Optional[List[float]] = None,
+    reject_records: Optional[list[dict[str, Any]]] = None,
+    vcd_shadow_num_samples: int = 1,
+    sample_idx: int = -1,
+    turn_idx: int = -1,
     seed: int = 0,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
@@ -297,6 +244,7 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
+    decode_step = 0
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -345,6 +293,7 @@ def dflash_generate(
             final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
+            vcd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -358,12 +307,44 @@ def dflash_generate(
         )
 
         posterior = sample(output.logits, temperature , gen=gen)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        acceptance_length = int((block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item())
+
+        if block_size > 1 and reject_records is not None and acceptance_length < (block_size - 1):
+            reject_offset = acceptance_length
+            target_token_id = int(posterior[0, reject_offset].item())
+            sampled_draft_id = int(block_output_ids[0, reject_offset + 1].item())
+            vcd_shadow_sampled_id = int(vcd_shadow_sampled_tokens[0, reject_offset].item())
+
+            positive_step_logits = positive_draft_logits[0, reject_offset, :].float()
+            vcd_step_logits = final_draft_logits[0, reject_offset, :].float()
+            posterior_step_logits = output.logits[0, reject_offset, :].float()
+
+            reject_records.append(
+                token_level_reporting.build_reject_record(
+                    tokenizer=tokenizer,
+                    sample_idx=sample_idx,
+                    turn_idx=turn_idx,
+                    decode_step=decode_step,
+                    start=start,
+                    reject_offset=reject_offset,
+                    target_token_id=target_token_id,
+                    sampled_draft_id=sampled_draft_id,
+                    shadow_sampled_id=vcd_shadow_sampled_id,
+                    positive_step_logits=positive_step_logits,
+                    contrastive_step_logits=vcd_step_logits,
+                    posterior_step_logits=posterior_step_logits,
+                    candidate_mask_step=candidate_mask[0, reject_offset, :],
+                    shadow_num_samples=vcd_shadow_num_samples,
+                    gen=gen,
+                )
+            )
+
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
         acceptance_lengths.append(acceptance_length+1)
         start += acceptance_length + 1
+        decode_step += 1
         past_key_values_target.crop(start)
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
@@ -419,6 +400,21 @@ def main() -> None:
         type=int,
         default=1,
         help="Sample replacement token from top-k nearest neighbors (1 = deterministic nearest).",
+    )
+    parser.add_argument(
+        "--enable-token-analysis",
+        action="store_true",
+        default=False,
+        help="Collect token-level reject events and export summary/plots/report for CD_v4.",
+    )
+    parser.add_argument("--analysis-report-dir", type=str, default=None)
+    parser.add_argument("--analysis-no-plots", action="store_true")
+    parser.add_argument("--analysis-max-example-rows", type=int, default=30)
+    parser.add_argument(
+        "--analysis-shadow-num-samples",
+        type=int,
+        default=1,
+        help="Monte Carlo samples per reject position to estimate rescue probability.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -482,6 +478,7 @@ def main() -> None:
         dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
     divergence_accumulator: List[float] = [] 
+    reject_records: list[dict[str, Any]] = []
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
@@ -501,6 +498,7 @@ def main() -> None:
                 response[bs] = dflash_generate(
                     model=draft_model,
                     target=target,
+                    tokenizer=tokenizer,
                     input_ids=input_ids,
                     mask_token_id=draft_model.mask_token_id,
                     max_new_tokens=args.max_new_tokens,
@@ -513,8 +511,12 @@ def main() -> None:
                     negative_context_noise_std=args.negative_context_noise_std,
                     token_neighbor_table=token_neighbor_table,
                     negative_token_neighbor_topk=args.negative_token_neighbor_topk,
-                    divergence_accumulator = divergence_accumulator,
-                    seed = sample_seed + bs,
+                    divergence_accumulator=divergence_accumulator if bs == block_size else None,
+                    reject_records=reject_records if (args.enable_token_analysis and bs == block_size) else None,
+                    vcd_shadow_num_samples=args.analysis_shadow_num_samples,
+                    sample_idx=idx,
+                    turn_idx=turn_index,
+                    seed=sample_seed + bs,
                 )
             
             spec_response = response[block_size]
@@ -525,9 +527,11 @@ def main() -> None:
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
+        reject_records = dist.gather(reject_records, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
+        reject_records = list(chain(*reject_records))
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
@@ -546,6 +550,53 @@ def main() -> None:
         print(f"Average KL divergence between draft logits: {avg_divergence:.5f}")
         # Optionally also show min/max for a quick sense of spread
         print(f"  Min KL: {min(divergence_accumulator):.5f}   Max KL: {max(divergence_accumulator):.5f}")
+
+    if args.enable_token_analysis:
+        report_dir = token_level_reporting.build_report_dir(args.dataset, args.analysis_report_dir)
+        summary = token_level_reporting.build_summary(
+            reject_records,
+            dataset=args.dataset,
+            seed=args.seed,
+            block_size=block_size,
+            alpha=args.cd_alpha,
+            beta=args.cd_beta,
+            shadow_num_samples=args.analysis_shadow_num_samples,
+            negative_context_dropout=args.negative_context_dropout,
+            negative_context_noise_std=args.negative_context_noise_std,
+            compare_name="CDv4",
+        )
+
+        jsonl_path = report_dir / "reject_records.jsonl"
+        csv_path = report_dir / "reject_records.csv"
+        summary_path = report_dir / "summary.json"
+        report_md_path = report_dir / "report.md"
+
+        token_level_reporting.write_jsonl(jsonl_path, reject_records)
+        token_level_reporting.write_csv(csv_path, reject_records)
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+        plot_files = [] if args.analysis_no_plots else token_level_reporting.maybe_create_plots(
+            report_dir,
+            reject_records,
+            compare_name="CDv4",
+        )
+        token_level_reporting.write_report_md(
+            report_path=report_md_path,
+            summary=summary,
+            records=reject_records,
+            plot_files=plot_files,
+            max_rows=args.analysis_max_example_rows,
+            compare_name="CDv4",
+        )
+
+        print(f"Reject events recorded: {summary.get('reject_events', 0)}")
+        print(f"Analysis report directory: {report_dir}")
+        print(f"  - {jsonl_path.name}")
+        print(f"  - {csv_path.name}")
+        print(f"  - {summary_path.name}")
+        print(f"  - {report_md_path.name}")
+        if plot_files:
+            print(f"  - plots: {', '.join(plot_files)}")
 
 if __name__ == "__main__":
     main()
