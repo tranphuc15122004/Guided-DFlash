@@ -117,7 +117,9 @@ def dflash_generate(
         )
 
         posterior = sample(output.logits, temperature, gen=gen)
+        
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
