@@ -162,6 +162,8 @@ def build_cd_candidate_mask(
     return candidate_mask
 
 
+
+
 def build_topk_probability_mask(
     reference_logits: torch.Tensor,
     top_k: int = 64,
@@ -318,6 +320,7 @@ def dflash_generate(
                     reference_logits=positive_draft_logits,
                     top_k=64,
                 )
+            
                         
             final_draft_logits = apply_cd_logits(
                 first_logits=positive_draft_logits,
