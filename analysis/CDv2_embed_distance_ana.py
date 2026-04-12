@@ -538,6 +538,46 @@ def _sanitize_md_text(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", "\\n")
 
 
+def _format_case_distance_stats_row(summary: dict[str, Any], case: str) -> dict[str, Any]:
+    case_stat = summary.get("focus_cases", {}).get(case, {})
+    l2_stat = case_stat.get("first_token_embedding_l2", {})
+    cos_stat = case_stat.get("first_token_embedding_cosine_distance", {})
+    count = int(case_stat.get("count", 0))
+
+    def _fmt(value: float) -> str:
+        if count <= 0:
+            return "n/a"
+        return f"{value:.4f}"
+
+    return {
+        "case_name": CASE_DISPLAY_NAMES.get(case, case),
+        "count": count,
+        "rate": float(case_stat.get("rate", 0.0) * 100.0),
+        "l2_mean": _fmt(float(l2_stat.get("mean", 0.0))),
+        "l2_median": _fmt(float(l2_stat.get("median", 0.0))),
+        "l2_p90": _fmt(float(l2_stat.get("p90", 0.0))),
+        "cos_mean": _fmt(float(cos_stat.get("mean", 0.0))),
+        "cos_median": _fmt(float(cos_stat.get("median", 0.0))),
+        "cos_p90": _fmt(float(cos_stat.get("p90", 0.0))),
+    }
+
+
+def _write_requested_case_distance_table(lines: list[str], summary: dict[str, Any]) -> None:
+    lines.append("## Requested 3-Case Embedding Distance Stats")
+    lines.append(
+        "| Case | Count | Rate | L2 mean | L2 median | L2 p90 | CosDist mean | CosDist median | CosDist p90 |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for case in [CASE_IMPROVED, CASE_WORSE_DROP, CASE_WORSE_NOT_PUSH]:
+        row = _format_case_distance_stats_row(summary, case)
+        lines.append(
+            "| {case_name} | {count} | {rate:.2f}% | {l2_mean} | {l2_median} | {l2_p90} | {cos_mean} | {cos_median} | {cos_p90} |".format(
+                **row
+            )
+        )
+    lines.append("")
+
+
 def _write_report_md(
     report_path: Path,
     summary: dict[str, Any],
@@ -606,6 +646,8 @@ def _write_report_md(
             )
         )
     lines.append("")
+
+    _write_requested_case_distance_table(lines, summary)
 
     lines.append("## Not-Push Subtypes")
     subtype_counts = summary.get("not_push_subtype_counts", {})
@@ -764,6 +806,27 @@ def _write_report_md(
         )
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_insights_md(insights_path: Path, summary: dict[str, Any]) -> None:
+    lines: list[str] = []
+    lines.append(f"# Embed-Distance Insights for `{insights_path.parent.name}`")
+    lines.append("")
+    lines.append("## Requested Stats")
+    _write_requested_case_distance_table(lines, summary)
+
+    focus = summary.get("focus_cases", {})
+    improved_count = int(focus.get(CASE_IMPROVED, {}).get("count", 0))
+    dropped_count = int(focus.get(CASE_WORSE_DROP, {}).get("count", 0))
+    not_push_count = int(focus.get(CASE_WORSE_NOT_PUSH, {}).get("count", 0))
+
+    lines.append("## Quick Read")
+    lines.append(f"- Improved cases (target pushed to top-1): {improved_count}")
+    lines.append(f"- Worsened cases (target dropped from top-1): {dropped_count}")
+    lines.append(f"- Worsened cases (target not pushed to top-1): {not_push_count}")
+    lines.append("")
+
+    insights_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _maybe_create_plots(
@@ -1178,7 +1241,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cd-alpha", type=float, default=0.1)
-    parser.add_argument("--cd-beta", type=float, default=0.1)
+    parser.add_argument("--cd-beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
@@ -1340,6 +1403,7 @@ def main() -> None:
     records_csv = report_dir / "first_token_case_records.csv"
     summary_json = report_dir / "first_token_embed_summary.json"
     report_md = report_dir / "first_token_embed_report.md"
+    insights_md = report_dir / "insights.md"
 
     _write_jsonl(records_jsonl, first_token_case_records)
     _write_csv(records_csv, first_token_case_records)
@@ -1353,6 +1417,7 @@ def main() -> None:
         plot_files=plot_files,
         max_rows=args.max_example_rows,
     )
+    _write_insights_md(insights_md, summary)
 
     print(f"First-token analysis records: {summary.get('num_records', 0)}")
     if summary.get("num_records", 0) > 0:
@@ -1387,6 +1452,7 @@ def main() -> None:
     print(f"  - {records_csv.name}")
     print(f"  - {summary_json.name}")
     print(f"  - {report_md.name}")
+    print(f"  - {insights_md.name}")
     if plot_files:
         print(f"  - plots: {', '.join(plot_files)}")
 

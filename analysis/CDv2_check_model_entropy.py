@@ -18,12 +18,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
 
-NEGATIVE_HIDDEN_MODE = 'shuffle_tokens' 
-TOP64_MASK_MODE = True 
+NEGATIVE_HIDDEN_MODE = 'mask_zero' 
+TOP64_MASK_MODE = False 
 
 """ 
-Schema: CDv2
-Goal: To statistic and study draft model entropy
+CDv2
+Goal: Study draft model entropy
 """
 
 
@@ -83,6 +83,130 @@ def _build_histogram(values: np.ndarray, bins: int, value_range: tuple[float, fl
         "counts": [int(x) for x in counts.tolist()],
         "rates": [float(x) for x in rates.tolist()],
     }
+
+
+def init_vocab_probability_histogram_accumulator(max_positions: int, bins: int) -> dict[str, Any]:
+    max_positions = max(1, int(max_positions))
+    bins = max(2, int(bins))
+    return {
+        "max_positions": max_positions,
+        "bins": bins,
+        "bin_edges": np.linspace(0.0, 1.0, bins + 1, dtype=np.float64),
+        "counts": np.zeros((max_positions, bins), dtype=np.int64),
+        "num_distributions": np.zeros(max_positions, dtype=np.int64),
+        "vocab_values": np.zeros(max_positions, dtype=np.int64),
+    }
+
+
+def update_vocab_probability_histogram_accumulator(
+    accumulator: Optional[dict[str, Any]],
+    probs: torch.Tensor,
+) -> None:
+    if accumulator is None or probs.numel() == 0:
+        return
+
+    max_positions = int(accumulator["max_positions"])
+    bin_edges = np.asarray(accumulator["bin_edges"], dtype=np.float64)
+    counts = np.asarray(accumulator["counts"], dtype=np.int64)
+    num_distributions = np.asarray(accumulator["num_distributions"], dtype=np.int64)
+    vocab_values = np.asarray(accumulator["vocab_values"], dtype=np.int64)
+
+    batch_size, num_steps, _ = probs.shape
+    use_steps = min(max_positions, int(num_steps))
+    probs_np = probs[:, :use_steps, :].detach().float().cpu().numpy()
+
+    for pos in range(use_steps):
+        vals = probs_np[:, pos, :].reshape(-1)
+        pos_counts, _ = np.histogram(vals, bins=bin_edges)
+        counts[pos] += pos_counts.astype(np.int64)
+        num_distributions[pos] += int(batch_size)
+        vocab_values[pos] += int(vals.size)
+
+
+def finalize_vocab_probability_histogram_accumulator(
+    accumulator: Optional[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if accumulator is None:
+        return []
+
+    max_positions = int(accumulator["max_positions"])
+    bin_edges = np.asarray(accumulator["bin_edges"], dtype=np.float64)
+    counts = np.asarray(accumulator["counts"], dtype=np.int64)
+    num_distributions = np.asarray(accumulator["num_distributions"], dtype=np.int64)
+    vocab_values = np.asarray(accumulator["vocab_values"], dtype=np.int64)
+
+    rows: list[dict[str, Any]] = []
+    for pos in range(max_positions):
+        total_values = int(vocab_values[pos])
+        pos_counts = counts[pos]
+        if total_values > 0:
+            rates = (pos_counts.astype(np.float64) / float(total_values)).tolist()
+        else:
+            rates = [0.0 for _ in range(pos_counts.size)]
+
+        rows.append(
+            {
+                "block_position": int(pos + 1),
+                "num_distributions": int(num_distributions[pos]),
+                "vocab_values": total_values,
+                "bin_edges": [float(x) for x in bin_edges.tolist()],
+                "counts": [int(x) for x in pos_counts.tolist()],
+                "rates": [float(x) for x in rates],
+            }
+        )
+
+    return rows
+
+
+def merge_vocab_probability_histogram_accumulators(
+    accumulators: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not accumulators:
+        return None
+
+    first = accumulators[0]
+    merged = init_vocab_probability_histogram_accumulator(
+        max_positions=int(first["max_positions"]),
+        bins=int(first["bins"]),
+    )
+
+    for acc in accumulators:
+        merged["counts"] += np.asarray(acc["counts"], dtype=np.int64)
+        merged["num_distributions"] += np.asarray(acc["num_distributions"], dtype=np.int64)
+        merged["vocab_values"] += np.asarray(acc["vocab_values"], dtype=np.int64)
+
+    return merged
+
+
+def write_vocab_probability_histogram_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "block_position",
+        "num_distributions",
+        "vocab_values",
+        "bin_left",
+        "bin_right",
+        "count",
+        "rate",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            edges = row.get("bin_edges", [])
+            counts = row.get("counts", [])
+            rates = row.get("rates", [])
+            for i in range(max(0, len(edges) - 1)):
+                writer.writerow(
+                    {
+                        "block_position": int(row.get("block_position", 0)),
+                        "num_distributions": int(row.get("num_distributions", 0)),
+                        "vocab_values": int(row.get("vocab_values", 0)),
+                        "bin_left": float(edges[i]),
+                        "bin_right": float(edges[i + 1]),
+                        "count": int(counts[i]) if i < len(counts) else 0,
+                        "rate": float(rates[i]) if i < len(rates) else 0.0,
+                    }
+                )
 
 
 def _safe_corrcoef(x: np.ndarray, y: np.ndarray) -> float:
@@ -157,605 +281,8 @@ def _build_calibration(confidence: np.ndarray, correctness: np.ndarray, num_bins
         "bins": rows,
     }
 
-
-def _collect_draft_entropy_records(
-    *,
-    records: list[dict[str, Any]],
-    positive_logits: torch.Tensor,
-    sampled_draft_ids: torch.Tensor,
-    posterior_ids: torch.Tensor,
-    acceptance_lengths: torch.Tensor,
-    sample_idx: int,
-    turn_idx: int,
-    decode_step: int,
-    block_start: int,
-) -> None:
-    if positive_logits.numel() == 0:
-        return
-
-    logits = positive_logits.float()
-    probs = torch.softmax(logits, dim=-1)
-    log_probs = torch.log_softmax(logits, dim=-1)
-
-    entropy = -(probs * log_probs).sum(dim=-1)
-    entropy_bits = entropy / np.log(2.0)
-    vocab_size = probs.shape[-1]
-    entropy_norm = entropy / max(np.log(vocab_size), 1e-12)
-    effective_support = torch.exp(entropy)
-
-    top_k = min(10, vocab_size)
-    topk_vals, topk_ids = torch.topk(probs, k=top_k, dim=-1)
-    top1_prob = topk_vals[..., 0]
-    top1_ids = topk_ids[..., 0]
-    top2_prob = topk_vals[..., 1] if top_k > 1 else torch.zeros_like(top1_prob)
-    top1_margin = top1_prob - top2_prob
-    top5_mass = topk_vals[..., : min(5, top_k)].sum(dim=-1)
-    top10_mass = topk_vals.sum(dim=-1)
-
-    target_prob = probs.gather(dim=-1, index=posterior_ids.unsqueeze(-1)).squeeze(-1)
-    sampled_prob = probs.gather(dim=-1, index=sampled_draft_ids.unsqueeze(-1)).squeeze(-1)
-    target_logprob = log_probs.gather(dim=-1, index=posterior_ids.unsqueeze(-1)).squeeze(-1)
-    sampled_logprob = log_probs.gather(dim=-1, index=sampled_draft_ids.unsqueeze(-1)).squeeze(-1)
-
-    batch_size, num_steps = sampled_draft_ids.shape
-    for b in range(batch_size):
-        accepted_len = int(acceptance_lengths[b].item())
-        for i in range(num_steps):
-            sampled_id = int(sampled_draft_ids[b, i].item())
-            target_id = int(posterior_ids[b, i].item())
-            positive_top1_id = int(top1_ids[b, i].item())
-            sampled_match = int(sampled_id == target_id)
-            accepted_by_target = int(i < accepted_len)
-
-            records.append(
-                {
-                    "sample_idx": int(sample_idx),
-                    "turn_idx": int(turn_idx),
-                    "decode_step": int(decode_step),
-                    "absolute_position": int(block_start + i + 1),
-                    "block_position": int(i + 1),
-                    "sampled_draft_id": sampled_id,
-                    "target_token_id": target_id,
-                    "positive_top1_id": positive_top1_id,
-                    "sampled_matches_target": sampled_match,
-                    "accepted_by_target": accepted_by_target,
-                    "positive_argmax_hit": int(positive_top1_id == target_id),
-                    "entropy_nats": float(entropy[b, i].item()),
-                    "entropy_bits": float(entropy_bits[b, i].item()),
-                    "normalized_entropy": float(entropy_norm[b, i].item()),
-                    "effective_support": float(effective_support[b, i].item()),
-                    "top1_prob": float(top1_prob[b, i].item()),
-                    "top2_prob": float(top2_prob[b, i].item()),
-                    "top1_margin": float(top1_margin[b, i].item()),
-                    "top5_mass": float(top5_mass[b, i].item()),
-                    "top10_mass": float(top10_mass[b, i].item()),
-                    "target_prob": float(target_prob[b, i].item()),
-                    "target_logprob": float(target_logprob[b, i].item()),
-                    "sampled_prob_under_positive": float(sampled_prob[b, i].item()),
-                    "sampled_logprob_under_positive": float(sampled_logprob[b, i].item()),
-                    "target_minus_sampled_prob": float((target_prob[b, i] - sampled_prob[b, i]).item()),
-                }
-            )
-
-
-def _build_entropy_band_summary(
-    entropy_norm: np.ndarray,
-    top1_prob: np.ndarray,
-    positive_hit: np.ndarray,
-    accepted: np.ndarray,
-) -> dict[str, Any]:
-    bands = {
-        "low_entropy_[0.0,0.4)": (0.0, 0.4),
-        "mid_entropy_[0.4,0.7)": (0.4, 0.7),
-        "high_entropy_[0.7,1.0]": (0.7, 1.0000001),
-    }
-    out: dict[str, Any] = {}
-    total = max(1, int(entropy_norm.size))
-    for name, (lo, hi) in bands.items():
-        mask = (entropy_norm >= lo) & (entropy_norm < hi)
-        count = int(mask.sum())
-        if count == 0:
-            out[name] = {
-                "count": 0,
-                "rate": 0.0,
-                "mean_top1_prob": 0.0,
-                "positive_argmax_hit_rate": 0.0,
-                "accepted_by_target_rate": 0.0,
-            }
-            continue
-        out[name] = {
-            "count": count,
-            "rate": float(count / total),
-            "mean_top1_prob": float(top1_prob[mask].mean()),
-            "positive_argmax_hit_rate": float(positive_hit[mask].mean()),
-            "accepted_by_target_rate": float(accepted[mask].mean()),
-        }
-    return out
-
-
-def _build_entropy_band_distribution(entropy_norm: np.ndarray) -> dict[str, Any]:
-    bands = {
-        "low_entropy_[0.0,0.4)": (0.0, 0.4),
-        "mid_entropy_[0.4,0.7)": (0.4, 0.7),
-        "high_entropy_[0.7,1.0]": (0.7, 1.0000001),
-    }
-    out: dict[str, Any] = {}
-    total = max(1, int(entropy_norm.size))
-    for name, (lo, hi) in bands.items():
-        mask = (entropy_norm >= lo) & (entropy_norm < hi)
-        count = int(mask.sum())
-        out[name] = {
-            "count": count,
-            "rate": float(count / total),
-        }
-    return out
-
-
-def build_entropy_summary(
-    records: list[dict[str, Any]],
-    *,
-    args: argparse.Namespace,
-    block_size: int,
-    decoding_speedup: float,
-    avg_acceptance_length: float,
-) -> dict[str, Any]:
-    meta = {
-        "dataset": args.dataset,
-        "seed": int(args.seed),
-        "block_size": int(block_size),
-        "model_name_or_path": args.model_name_or_path,
-        "draft_name_or_path": args.draft_name_or_path,
-        "temperature": float(args.temperature),
-        "cd_alpha": float(args.cd_alpha),
-        "cd_beta": float(args.cd_beta),
-        "negative_context_dropout": float(args.negative_context_dropout),
-        "negative_context_noise_std": float(args.negative_context_noise_std),
-        "negative_hidden_mode": args.negative_hidden_mode,
-        "top64_mask_mode": bool(TOP64_MASK_MODE),
-        "decoding_speedup": float(decoding_speedup),
-        "avg_acceptance_length": float(avg_acceptance_length),
-    }
-
-    if not records:
-        return {
-            "meta": meta,
-            "num_records": 0,
-            "note": "No draft-token records were collected. This happens when block_size <= 1.",
-        }
-
-    entropy = np.asarray([r["entropy_nats"] for r in records], dtype=np.float64)
-    entropy_bits = np.asarray([r["entropy_bits"] for r in records], dtype=np.float64)
-    entropy_norm = np.asarray([r["normalized_entropy"] for r in records], dtype=np.float64)
-    top1_prob = np.asarray([r["top1_prob"] for r in records], dtype=np.float64)
-    top1_margin = np.asarray([r["top1_margin"] for r in records], dtype=np.float64)
-    top5_mass = np.asarray([r["top5_mass"] for r in records], dtype=np.float64)
-    top10_mass = np.asarray([r["top10_mass"] for r in records], dtype=np.float64)
-    target_prob = np.asarray([r["target_prob"] for r in records], dtype=np.float64)
-    sampled_prob = np.asarray([r["sampled_prob_under_positive"] for r in records], dtype=np.float64)
-    target_minus_sampled_prob = np.asarray([r["target_minus_sampled_prob"] for r in records], dtype=np.float64)
-    effective_support = np.asarray([r["effective_support"] for r in records], dtype=np.float64)
-    positive_hit = np.asarray([r["positive_argmax_hit"] for r in records], dtype=np.float64)
-    sampled_match = np.asarray([r["sampled_matches_target"] for r in records], dtype=np.float64)
-    accepted = np.asarray([r["accepted_by_target"] for r in records], dtype=np.float64)
-
-    calibration = _build_calibration(top1_prob, positive_hit, num_bins=args.calibration_bins)
-
-    accepted_mask = accepted == 1
-    rejected_mask = accepted == 0
-    num_records = int(len(records))
-    accepted_count = int(accepted_mask.sum())
-    rejected_count = int(rejected_mask.sum())
-    entropy_norm_median = float(np.median(entropy_norm))
-
-    def _subset_stat(mask: np.ndarray, values: np.ndarray) -> dict[str, float]:
-        if int(mask.sum()) == 0:
-            return {}
-        return _describe_distribution(values[mask])
-
-    confidence_thresholds: dict[str, Any] = {}
-    for threshold in [0.5, 0.7, 0.9]:
-        mask = top1_prob >= threshold
-        key = f"top1_prob_ge_{threshold:.1f}"
-        count = int(mask.sum())
-        if count == 0:
-            confidence_thresholds[key] = {
-                "count": 0,
-                "coverage_rate": 0.0,
-                "positive_argmax_hit_rate": 0.0,
-                "accepted_by_target_rate": 0.0,
-            }
-            continue
-        confidence_thresholds[key] = {
-            "count": count,
-            "coverage_rate": float(mask.mean()),
-            "positive_argmax_hit_rate": float(positive_hit[mask].mean()),
-            "accepted_by_target_rate": float(accepted[mask].mean()),
-        }
-
-    rejected_focus = {
-        "rejected_count": rejected_count,
-        "rejected_rate": float(rejected_count / max(1, num_records)),
-        "accepted_count": accepted_count,
-        "accepted_rate": float(accepted_count / max(1, num_records)),
-        "positive_argmax_hit_rate": _safe_mask_mean(positive_hit, rejected_mask),
-        "sampled_matches_target_rate": _safe_mask_mean(sampled_match, rejected_mask),
-        "entropy_norm_ge_global_median_rate": _safe_mask_mean((entropy_norm >= entropy_norm_median).astype(np.float64), rejected_mask),
-        "entropy_nats": _subset_stat(rejected_mask, entropy),
-        "entropy_bits": _subset_stat(rejected_mask, entropy_bits),
-        "normalized_entropy": _subset_stat(rejected_mask, entropy_norm),
-        "effective_support": _subset_stat(rejected_mask, effective_support),
-        "top1_prob": _subset_stat(rejected_mask, top1_prob),
-        "top1_margin": _subset_stat(rejected_mask, top1_margin),
-        "top5_mass": _subset_stat(rejected_mask, top5_mass),
-        "top10_mass": _subset_stat(rejected_mask, top10_mass),
-        "target_prob": _subset_stat(rejected_mask, target_prob),
-        "sampled_prob_under_positive": _subset_stat(rejected_mask, sampled_prob),
-        "target_minus_sampled_prob": _subset_stat(rejected_mask, target_minus_sampled_prob),
-        "rejected_minus_accepted": {
-            "entropy_nats_mean": _safe_mask_mean(entropy, rejected_mask) - _safe_mask_mean(entropy, accepted_mask),
-            "normalized_entropy_mean": _safe_mask_mean(entropy_norm, rejected_mask) - _safe_mask_mean(entropy_norm, accepted_mask),
-            "top1_prob_mean": _safe_mask_mean(top1_prob, rejected_mask) - _safe_mask_mean(top1_prob, accepted_mask),
-            "top1_margin_mean": _safe_mask_mean(top1_margin, rejected_mask) - _safe_mask_mean(top1_margin, accepted_mask),
-            "target_prob_mean": _safe_mask_mean(target_prob, rejected_mask) - _safe_mask_mean(target_prob, accepted_mask),
-        },
-        "calibration": _build_calibration(
-            top1_prob[rejected_mask],
-            positive_hit[rejected_mask],
-            num_bins=args.calibration_bins,
-        ),
-        "entropy_bands": _build_entropy_band_distribution(entropy_norm[rejected_mask]),
-        "histograms": {
-            "top1_prob": _build_histogram(top1_prob[rejected_mask], bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "normalized_entropy": _build_histogram(entropy_norm[rejected_mask], bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "top1_margin": _build_histogram(top1_margin[rejected_mask], bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "target_prob": _build_histogram(target_prob[rejected_mask], bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "sampled_prob_under_positive": _build_histogram(sampled_prob[rejected_mask], bins=args.histogram_bins, value_range=(0.0, 1.0)),
-        },
-    }
-
-    return {
-        "meta": meta,
-        "num_records": num_records,
-        "num_unique_samples": int(len(set(int(r["sample_idx"]) for r in records))),
-        "num_unique_turns": int(len(set((int(r["sample_idx"]), int(r["turn_idx"])) for r in records))),
-        "rates": {
-            "positive_argmax_hit_rate": float(positive_hit.mean()),
-            "sampled_matches_target_rate": float(sampled_match.mean()),
-            "accepted_by_target_rate": float(accepted.mean()),
-        },
-        "entropy": {
-            "entropy_nats": _describe_distribution(entropy),
-            "normalized_entropy": _describe_distribution(entropy_norm),
-            "effective_support": _describe_distribution(effective_support),
-            "accepted_subset_entropy": _subset_stat(accepted_mask, entropy),
-            "rejected_subset_entropy": _subset_stat(rejected_mask, entropy),
-        },
-        "confidence": {
-            "top1_prob": _describe_distribution(top1_prob),
-            "top1_margin": _describe_distribution(top1_margin),
-            "top5_mass": _describe_distribution(top5_mass),
-            "top10_mass": _describe_distribution(top10_mass),
-            "target_prob": _describe_distribution(target_prob),
-            "sampled_prob_under_positive": _describe_distribution(sampled_prob),
-            "confidence_thresholds": confidence_thresholds,
-        },
-        "rejected_token_focus": rejected_focus,
-        "entropy_bands": _build_entropy_band_summary(entropy_norm, top1_prob, positive_hit, accepted),
-        "correlation": {
-            "corr_top1_prob_vs_positive_hit": _safe_corrcoef(top1_prob, positive_hit),
-            "corr_top1_margin_vs_positive_hit": _safe_corrcoef(top1_margin, positive_hit),
-            "corr_normalized_entropy_vs_positive_hit": _safe_corrcoef(entropy_norm, positive_hit),
-            "corr_top1_prob_vs_accepted": _safe_corrcoef(top1_prob, accepted),
-            "corr_normalized_entropy_vs_accepted": _safe_corrcoef(entropy_norm, accepted),
-        },
-        "calibration": calibration,
-        "histograms": {
-            "top1_prob": _build_histogram(top1_prob, bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "normalized_entropy": _build_histogram(entropy_norm, bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "top1_margin": _build_histogram(top1_margin, bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "target_prob": _build_histogram(target_prob, bins=args.histogram_bins, value_range=(0.0, 1.0)),
-            "sampled_prob_under_positive": _build_histogram(sampled_prob, bins=args.histogram_bins, value_range=(0.0, 1.0)),
-        },
-    }
-
-
-def maybe_create_entropy_plots(
-    report_dir: Path,
-    records: list[dict[str, Any]],
-    summary: dict[str, Any],
-) -> list[str]:
-    if not records:
-        return []
-
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        logger.warning(f"Skip plotting because matplotlib is unavailable: {exc}")
-        return []
-
-    top1_prob = np.asarray([r["top1_prob"] for r in records], dtype=np.float64)
-    entropy_norm = np.asarray([r["normalized_entropy"] for r in records], dtype=np.float64)
-    positive_hit = np.asarray([r["positive_argmax_hit"] for r in records], dtype=np.float64)
-    accepted = np.asarray([r["accepted_by_target"] for r in records], dtype=np.float64)
-
-    plot_files: list[str] = []
-
-    plt.figure(figsize=(8.0, 4.8))
-    plt.hist(top1_prob[accepted == 1], bins=60, alpha=0.65, label="Accepted")
-    plt.hist(top1_prob[accepted == 0], bins=60, alpha=0.65, label="Rejected")
-    plt.xlabel("Top-1 probability (positive draft)")
-    plt.ylabel("Count")
-    plt.title("Distribution of Draft Top-1 Probability")
-    plt.legend()
-    p1 = report_dir / "draft_top1_probability_hist.png"
-    plt.tight_layout()
-    plt.savefig(p1, dpi=160)
-    plt.close()
-    plot_files.append(p1.name)
-
-    plt.figure(figsize=(8.0, 4.8))
-    plt.hist(entropy_norm[accepted == 1], bins=60, alpha=0.65, label="Accepted")
-    plt.hist(entropy_norm[accepted == 0], bins=60, alpha=0.65, label="Rejected")
-    plt.xlabel("Normalized entropy")
-    plt.ylabel("Count")
-    plt.title("Distribution of Draft Normalized Entropy")
-    plt.legend()
-    p2 = report_dir / "draft_normalized_entropy_hist.png"
-    plt.tight_layout()
-    plt.savefig(p2, dpi=160)
-    plt.close()
-    plot_files.append(p2.name)
-
-    rejected_mask = accepted == 0
-    if int(rejected_mask.sum()) > 0:
-        plt.figure(figsize=(8.0, 4.8))
-        plt.hist(entropy_norm[rejected_mask], bins=60, alpha=0.85, color="#c44e52")
-        plt.xlabel("Normalized entropy")
-        plt.ylabel("Count")
-        plt.title("Rejected Tokens: Normalized Entropy")
-        p2b = report_dir / "draft_rejected_normalized_entropy_hist.png"
-        plt.tight_layout()
-        plt.savefig(p2b, dpi=160)
-        plt.close()
-        plot_files.append(p2b.name)
-
-        plt.figure(figsize=(8.0, 4.8))
-        plt.hist(top1_prob[rejected_mask], bins=60, alpha=0.85, color="#4c72b0")
-        plt.xlabel("Top-1 probability")
-        plt.ylabel("Count")
-        plt.title("Rejected Tokens: Top-1 Probability")
-        p2c = report_dir / "draft_rejected_top1_probability_hist.png"
-        plt.tight_layout()
-        plt.savefig(p2c, dpi=160)
-        plt.close()
-        plot_files.append(p2c.name)
-
-    cal = summary.get("calibration", {})
-    cal_bins = cal.get("bins", [])
-    if cal_bins:
-        xs = [(row["bin_left"] + row["bin_right"]) * 0.5 for row in cal_bins]
-        ys_conf = [row["avg_confidence"] for row in cal_bins]
-        ys_acc = [row["accuracy"] for row in cal_bins]
-
-        plt.figure(figsize=(7.2, 5.2))
-        plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1.2, color="black", label="Perfect calibration")
-        plt.plot(xs, ys_conf, marker="o", linewidth=1.8, label="Avg confidence")
-        plt.plot(xs, ys_acc, marker="s", linewidth=1.8, label="Empirical accuracy")
-        plt.xlabel("Confidence bin center")
-        plt.ylabel("Value")
-        plt.title(f"Reliability Diagram (ECE={cal.get('ece', 0.0):.4f})")
-        plt.ylim(0.0, 1.0)
-        plt.xlim(0.0, 1.0)
-        plt.legend()
-        p3 = report_dir / "draft_reliability_diagram.png"
-        plt.tight_layout()
-        plt.savefig(p3, dpi=160)
-        plt.close()
-        plot_files.append(p3.name)
-
-    max_points = 20000
-    if top1_prob.size > max_points:
-        idx = np.linspace(0, top1_prob.size - 1, max_points, dtype=np.int64)
-        top1_sc = top1_prob[idx]
-        entropy_sc = entropy_norm[idx]
-        hit_sc = positive_hit[idx]
-    else:
-        top1_sc = top1_prob
-        entropy_sc = entropy_norm
-        hit_sc = positive_hit
-
-    plt.figure(figsize=(7.8, 5.2))
-    plt.scatter(
-        top1_sc,
-        entropy_sc,
-        c=hit_sc,
-        cmap="coolwarm",
-        alpha=0.35,
-        s=10,
-    )
-    plt.xlabel("Top-1 probability")
-    plt.ylabel("Normalized entropy")
-    plt.title("Confidence vs Entropy (Color = Positive Argmax Hit)")
-    p4 = report_dir / "draft_confidence_vs_entropy_scatter.png"
-    plt.tight_layout()
-    plt.savefig(p4, dpi=160)
-    plt.close()
-    plot_files.append(p4.name)
-
-    return plot_files
-
-
-def write_entropy_report_md(
-    report_path: Path,
-    summary: dict[str, Any],
-    records: list[dict[str, Any]],
-    plot_files: list[str],
-    max_rows: int,
-) -> None:
-    lines: list[str] = []
-    lines.append("# Draft Entropy and Confidence Analysis")
-    lines.append("")
-
-    if summary.get("num_records", 0) == 0:
-        lines.append("No draft entropy records were collected.")
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-        return
-
-    rates = summary.get("rates", {})
-    entropy = summary.get("entropy", {})
-    confidence = summary.get("confidence", {})
-    rejected_focus = summary.get("rejected_token_focus", {})
-    cal = summary.get("calibration", {})
-    corr = summary.get("correlation", {})
-
-    lines.append("## Overall")
-    lines.append(f"- Number of draft-token records: **{summary['num_records']}**")
-    lines.append(f"- Positive argmax hit rate: **{rates.get('positive_argmax_hit_rate', 0.0) * 100:.2f}%**")
-    lines.append(f"- Sampled draft token match rate: **{rates.get('sampled_matches_target_rate', 0.0) * 100:.2f}%**")
-    lines.append(f"- Accepted-by-target rate: **{rates.get('accepted_by_target_rate', 0.0) * 100:.2f}%**")
-    lines.append(f"- ECE ({cal.get('num_bins', 0)} bins): **{cal.get('ece', 0.0):.5f}**")
-    lines.append(f"- MCE: **{cal.get('mce', 0.0):.5f}**")
-    lines.append("")
-
-    ent_nats = entropy.get("entropy_nats", {})
-    ent_norm = entropy.get("normalized_entropy", {})
-    lines.append("## Entropy")
-    lines.append(
-        f"- Entropy (nats) mean / median / p90: **{ent_nats.get('mean', 0.0):.4f} / {ent_nats.get('median', 0.0):.4f} / {ent_nats.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Normalized entropy mean / median / p90: **{ent_norm.get('mean', 0.0):.4f} / {ent_norm.get('median', 0.0):.4f} / {ent_norm.get('p90', 0.0):.4f}**"
-    )
-    lines.append("")
-
-    rej_ent_nats = rejected_focus.get("entropy_nats", {})
-    rej_ent_norm = rejected_focus.get("normalized_entropy", {})
-    rej_top1 = rejected_focus.get("top1_prob", {})
-    rej_margin = rejected_focus.get("top1_margin", {})
-    rej_cal = rejected_focus.get("calibration", {})
-    rej_delta = rejected_focus.get("rejected_minus_accepted", {})
-
-    lines.append("## Rejected-Token Focus")
-    lines.append(
-        f"- Rejected tokens: **{rejected_focus.get('rejected_count', 0)} / {summary['num_records']} ({rejected_focus.get('rejected_rate', 0.0) * 100:.2f}%)**"
-    )
-    lines.append(
-        f"- Rejected entropy (nats) mean / median / p90: **{rej_ent_nats.get('mean', 0.0):.4f} / {rej_ent_nats.get('median', 0.0):.4f} / {rej_ent_nats.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Rejected normalized entropy mean / median / p90: **{rej_ent_norm.get('mean', 0.0):.4f} / {rej_ent_norm.get('median', 0.0):.4f} / {rej_ent_norm.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Rejected top1-prob mean / median / p90: **{rej_top1.get('mean', 0.0):.4f} / {rej_top1.get('median', 0.0):.4f} / {rej_top1.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Rejected top1-margin mean / median / p90: **{rej_margin.get('mean', 0.0):.4f} / {rej_margin.get('median', 0.0):.4f} / {rej_margin.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Rejected positive-argmax-hit rate: **{rejected_focus.get('positive_argmax_hit_rate', 0.0) * 100:.2f}%**"
-    )
-    lines.append(
-        f"- Rejected ECE ({rej_cal.get('num_bins', 0)} bins): **{rej_cal.get('ece', 0.0):.5f}**"
-    )
-    lines.append(
-        f"- Rejected minus accepted mean entropy (nats): **{rej_delta.get('entropy_nats_mean', 0.0):+.4f}**"
-    )
-    lines.append(
-        f"- Rejected minus accepted mean top1-prob: **{rej_delta.get('top1_prob_mean', 0.0):+.4f}**"
-    )
-    lines.append("")
-
-    lines.append("### Rejected Entropy Bands")
-    lines.append("| Band | Count | Rate within rejected |")
-    lines.append("|---|---:|---:|")
-    for k, v in rejected_focus.get("entropy_bands", {}).items():
-        lines.append(f"| {k} | {v['count']} | {v['rate'] * 100:.2f}% |")
-    lines.append("")
-
-    top1 = confidence.get("top1_prob", {})
-    margin = confidence.get("top1_margin", {})
-    lines.append("## Confidence")
-    lines.append(
-        f"- Top-1 probability mean / median / p90: **{top1.get('mean', 0.0):.4f} / {top1.get('median', 0.0):.4f} / {top1.get('p90', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- Top-1 margin mean / median / p90: **{margin.get('mean', 0.0):.4f} / {margin.get('median', 0.0):.4f} / {margin.get('p90', 0.0):.4f}**"
-    )
-    lines.append("")
-
-    lines.append("## Correlation")
-    lines.append(
-        f"- corr(top1_prob, positive_hit): **{corr.get('corr_top1_prob_vs_positive_hit', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- corr(normalized_entropy, positive_hit): **{corr.get('corr_normalized_entropy_vs_positive_hit', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- corr(top1_prob, accepted): **{corr.get('corr_top1_prob_vs_accepted', 0.0):.4f}**"
-    )
-    lines.append(
-        f"- corr(normalized_entropy, accepted): **{corr.get('corr_normalized_entropy_vs_accepted', 0.0):.4f}**"
-    )
-    lines.append("")
-
-    lines.append("## Calibration by Confidence Bin")
-    lines.append("| Bin | Count | Rate | Avg confidence | Accuracy | Gap |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
-    for row in cal.get("bins", []):
-        bin_label = f"[{row['bin_left']:.1f}, {row['bin_right']:.1f})"
-        lines.append(
-            f"| {bin_label} | {row['count']} | {row['rate'] * 100:.2f}% | {row['avg_confidence']:.4f} | {row['accuracy']:.4f} | {row['gap']:.4f} |"
-        )
-    lines.append("")
-
-    lines.append("## Entropy Bands")
-    lines.append("| Band | Count | Rate | Mean top1 prob | Positive hit rate | Accepted rate |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
-    for k, v in summary.get("entropy_bands", {}).items():
-        lines.append(
-            f"| {k} | {v['count']} | {v['rate'] * 100:.2f}% | {v['mean_top1_prob']:.4f} | {v['positive_argmax_hit_rate'] * 100:.2f}% | {v['accepted_by_target_rate'] * 100:.2f}% |"
-        )
-    lines.append("")
-
-    if plot_files:
-        lines.append("## Plots")
-        for name in plot_files:
-            lines.append(f"![{name}]({name})")
-        lines.append("")
-
-    rejected_records = [r for r in records if r.get("accepted_by_target", 0) == 0]
-
-    lines.append("## Highest-Entropy Rejected Tokens")
-    lines.append("| sample | turn | step | pos | block_pos | entropy | top1_prob | top1_margin | hit | accepted | target_id | top1_id | sampled_id |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    high_entropy = sorted(rejected_records, key=lambda x: x["normalized_entropy"], reverse=True)[:max_rows]
-    for rec in high_entropy:
-        lines.append(
-            "| {sample_idx} | {turn_idx} | {decode_step} | {absolute_position} | {block_position} | "
-            "{normalized_entropy:.4f} | {top1_prob:.4f} | {top1_margin:.4f} | {positive_argmax_hit} | "
-            "{accepted_by_target} | {target_token_id} | {positive_top1_id} | {sampled_draft_id} |".format(**rec)
-        )
-    lines.append("")
-
-    lines.append("## Most-Confident Rejected Tokens")
-    lines.append("| sample | turn | step | pos | top1_prob | entropy | margin | target_id | top1_id | sampled_id | accepted |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    confident_rejected = sorted(rejected_records, key=lambda x: x["top1_prob"], reverse=True)[:max_rows]
-    for rec in confident_rejected:
-        lines.append(
-            "| {sample_idx} | {turn_idx} | {decode_step} | {absolute_position} | {top1_prob:.4f} | "
-            "{normalized_entropy:.4f} | {top1_margin:.4f} | {target_token_id} | {positive_top1_id} | "
-            "{sampled_draft_id} | {accepted_by_target} |".format(**rec)
-        )
-
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-
 def cuda_time() -> float:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -891,6 +418,8 @@ def build_cd_candidate_mask(
     return candidate_mask
 
 
+
+
 def build_topk_probability_mask(
     reference_logits: torch.Tensor,
     top_k: int = 64,
@@ -954,6 +483,604 @@ def log_logits_difference(
         f"L2 distance: {l2_dist.item():.4f}"
     )
 
+
+def _collect_draft_entropy_records(
+    *,
+    records: list[dict[str, Any]],
+    positive_logits: torch.Tensor,
+    sampled_draft_ids: torch.Tensor,
+    posterior_ids: torch.Tensor,
+    acceptance_lengths: torch.Tensor,
+    sample_idx: int,
+    turn_idx: int,
+    decode_step: int,
+    block_start: int,
+    vocab_probability_hist_accumulator: Optional[dict[str, Any]] = None,
+) -> None:
+    if positive_logits.numel() == 0:
+        return
+
+    logits = positive_logits.float()
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
+
+    update_vocab_probability_histogram_accumulator(vocab_probability_hist_accumulator, probs)
+
+    entropy = -(probs * log_probs).sum(dim=-1)
+    entropy_bits = entropy / np.log(2.0)
+    vocab_size = probs.shape[-1]
+    entropy_norm = entropy / max(np.log(vocab_size), 1e-12)
+    effective_support = torch.exp(entropy)
+
+    top_k = min(10, vocab_size)
+    topk_vals, topk_ids = torch.topk(probs, k=top_k, dim=-1)
+    top1_prob = topk_vals[..., 0]
+    top1_ids = topk_ids[..., 0]
+    top2_prob = topk_vals[..., 1] if top_k > 1 else torch.zeros_like(top1_prob)
+    top1_margin = top1_prob - top2_prob
+    top5_mass = topk_vals[..., : min(5, top_k)].sum(dim=-1)
+    top10_mass = topk_vals.sum(dim=-1)
+
+    target_prob = probs.gather(dim=-1, index=posterior_ids.unsqueeze(-1)).squeeze(-1)
+    sampled_prob = probs.gather(dim=-1, index=sampled_draft_ids.unsqueeze(-1)).squeeze(-1)
+    target_logprob = log_probs.gather(dim=-1, index=posterior_ids.unsqueeze(-1)).squeeze(-1)
+    sampled_logprob = log_probs.gather(dim=-1, index=sampled_draft_ids.unsqueeze(-1)).squeeze(-1)
+
+    batch_size, num_steps = sampled_draft_ids.shape
+    for b in range(batch_size):
+        accepted_len = int(acceptance_lengths[b].item())
+        for i in range(num_steps):
+            sampled_id = int(sampled_draft_ids[b, i].item())
+            target_id = int(posterior_ids[b, i].item())
+            positive_top1_id = int(top1_ids[b, i].item())
+            sampled_match = int(sampled_id == target_id)
+            accepted_by_target = int(i < accepted_len)
+
+            records.append(
+                {
+                    "sample_idx": int(sample_idx),
+                    "turn_idx": int(turn_idx),
+                    "decode_step": int(decode_step),
+                    "absolute_position": int(block_start + i + 1),
+                    "block_position": int(i + 1),
+                    "sampled_draft_id": sampled_id,
+                    "target_token_id": target_id,
+                    "positive_top1_id": positive_top1_id,
+                    "sampled_matches_target": sampled_match,
+                    "accepted_by_target": accepted_by_target,
+                    "positive_argmax_hit": int(positive_top1_id == target_id),
+                    "entropy_nats": float(entropy[b, i].item()),
+                    "entropy_bits": float(entropy_bits[b, i].item()),
+                    "normalized_entropy": float(entropy_norm[b, i].item()),
+                    "effective_support": float(effective_support[b, i].item()),
+                    "top1_prob": float(top1_prob[b, i].item()),
+                    "top2_prob": float(top2_prob[b, i].item()),
+                    "top1_margin": float(top1_margin[b, i].item()),
+                    "top5_mass": float(top5_mass[b, i].item()),
+                    "top10_mass": float(top10_mass[b, i].item()),
+                    "target_prob": float(target_prob[b, i].item()),
+                    "target_logprob": float(target_logprob[b, i].item()),
+                    "sampled_prob_under_positive": float(sampled_prob[b, i].item()),
+                    "sampled_logprob_under_positive": float(sampled_logprob[b, i].item()),
+                    "target_minus_sampled_prob": float((target_prob[b, i] - sampled_prob[b, i]).item()),
+                }
+            )
+
+
+def _build_entropy_band_summary(
+    entropy_norm: np.ndarray,
+    top1_prob: np.ndarray,
+    positive_hit: np.ndarray,
+    accepted: np.ndarray,
+) -> dict[str, Any]:
+    bands = {
+        "low_entropy_[0.0,0.4)": (0.0, 0.4),
+        "mid_entropy_[0.4,0.7)": (0.4, 0.7),
+        "high_entropy_[0.7,1.0]": (0.7, 1.0000001),
+    }
+    out: dict[str, Any] = {}
+    total = max(1, int(entropy_norm.size))
+    for name, (lo, hi) in bands.items():
+        mask = (entropy_norm >= lo) & (entropy_norm < hi)
+        count = int(mask.sum())
+        if count == 0:
+            out[name] = {
+                "count": 0,
+                "rate": 0.0,
+                "mean_top1_prob": 0.0,
+                "positive_argmax_hit_rate": 0.0,
+                "accepted_by_target_rate": 0.0,
+            }
+            continue
+        out[name] = {
+            "count": count,
+            "rate": float(count / total),
+            "mean_top1_prob": float(top1_prob[mask].mean()),
+            "positive_argmax_hit_rate": float(positive_hit[mask].mean()),
+            "accepted_by_target_rate": float(accepted[mask].mean()),
+        }
+    return out
+
+
+def _build_entropy_band_distribution(entropy_norm: np.ndarray) -> dict[str, Any]:
+    bands = {
+        "low_entropy_[0.0,0.4)": (0.0, 0.4),
+        "mid_entropy_[0.4,0.7)": (0.4, 0.7),
+        "high_entropy_[0.7,1.0]": (0.7, 1.0000001),
+    }
+    out: dict[str, Any] = {}
+    total = max(1, int(entropy_norm.size))
+    for name, (lo, hi) in bands.items():
+        mask = (entropy_norm >= lo) & (entropy_norm < hi)
+        count = int(mask.sum())
+        out[name] = {
+            "count": count,
+            "rate": float(count / total),
+        }
+    return out
+
+
+def _build_distribution_shape_summary(
+    top1_prob: np.ndarray,
+    effective_support: np.ndarray,
+    entropy: np.ndarray,
+    positive_hit: np.ndarray,
+    accepted: np.ndarray,
+) -> dict[str, Any]:
+    total = max(1, int(top1_prob.size))
+
+    def _summarize(mask: np.ndarray) -> dict[str, Any]:
+        count = int(mask.sum())
+        if count == 0:
+            return {
+                "count": 0,
+                "rate": 0.0,
+                "mean_top1_prob": 0.0,
+                "mean_effective_support": 0.0,
+                "mean_entropy_nats": 0.0,
+                "positive_argmax_hit_rate": 0.0,
+                "accepted_by_target_rate": 0.0,
+            }
+        return {
+            "count": count,
+            "rate": float(count / total),
+            "mean_top1_prob": float(top1_prob[mask].mean()),
+            "mean_effective_support": float(effective_support[mask].mean()),
+            "mean_entropy_nats": float(entropy[mask].mean()),
+            "positive_argmax_hit_rate": float(positive_hit[mask].mean()),
+            "accepted_by_target_rate": float(accepted[mask].mean()),
+        }
+
+    top1_bands = {
+        "very_sharp_[0.9,1.0]": top1_prob >= 0.9,
+        "sharp_[0.7,0.9)": (top1_prob >= 0.7) & (top1_prob < 0.9),
+        "medium_[0.5,0.7)": (top1_prob >= 0.5) & (top1_prob < 0.7),
+        "flat_[0.0,0.5)": top1_prob < 0.5,
+    }
+    support_bands = {
+        "very_sharp_[1,2]": effective_support <= 2.0,
+        "moderate_[2,10)": (effective_support > 2.0) & (effective_support < 10.0),
+        "diffuse_[10,+inf)": effective_support >= 10.0,
+    }
+
+    return {
+        "top1_prob_bands": {name: _summarize(mask) for name, mask in top1_bands.items()},
+        "effective_support_bands": {name: _summarize(mask) for name, mask in support_bands.items()},
+    }
+
+
+def _build_block_position_profile(
+    block_position: np.ndarray,
+    entropy: np.ndarray,
+    entropy_norm: np.ndarray,
+    effective_support: np.ndarray,
+    top1_prob: np.ndarray,
+    top5_mass: np.ndarray,
+    top10_mass: np.ndarray,
+    positive_hit: np.ndarray,
+    accepted: np.ndarray,
+) -> list[dict[str, Any]]:
+    if block_position.size == 0:
+        return []
+
+    positions = sorted(int(x) for x in np.unique(block_position))
+    total = max(1, int(block_position.size))
+    rows: list[dict[str, Any]] = []
+
+    for pos in positions:
+        mask = block_position == pos
+        count = int(mask.sum())
+        if count == 0:
+            continue
+
+        rows.append(
+            {
+                "block_position": int(pos),
+                "count": count,
+                "rate": float(count / total),
+                "positive_argmax_hit_rate": float(positive_hit[mask].mean()),
+                "accepted_by_target_rate": float(accepted[mask].mean()),
+                "entropy_nats": _describe_distribution(entropy[mask]),
+                "normalized_entropy": _describe_distribution(entropy_norm[mask]),
+                "effective_support": _describe_distribution(effective_support[mask]),
+                "top1_prob": _describe_distribution(top1_prob[mask]),
+                "top5_mass": _describe_distribution(top5_mass[mask]),
+                "top10_mass": _describe_distribution(top10_mass[mask]),
+                "sharpness_rates": {
+                    "top1_prob_ge_0.9": float((top1_prob[mask] >= 0.9).mean()),
+                    "top1_prob_ge_0.7": float((top1_prob[mask] >= 0.7).mean()),
+                    "effective_support_le_2": float((effective_support[mask] <= 2.0).mean()),
+                    "effective_support_gt_10": float((effective_support[mask] >= 10.0).mean()),
+                },
+            }
+        )
+
+    return rows
+
+
+def build_entropy_summary(
+    records: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    block_size: int,
+    decoding_speedup: float,
+    avg_acceptance_length: float,
+    vocab_probability_hist_accumulator: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    meta = {
+        "dataset": args.dataset,
+        "seed": int(args.seed),
+        "block_size": int(block_size),
+        "model_name_or_path": args.model_name_or_path,
+        "draft_name_or_path": args.draft_name_or_path,
+        "temperature": float(args.temperature),
+        "cd_alpha": float(args.cd_alpha),
+        "cd_beta": float(args.cd_beta),
+        "negative_context_dropout": float(args.negative_context_dropout),
+        "negative_context_noise_std": float(args.negative_context_noise_std),
+        "negative_hidden_mode": args.negative_hidden_mode,
+        "top64_mask_mode": bool(TOP64_MASK_MODE),
+        "decoding_speedup": float(decoding_speedup),
+        "avg_acceptance_length": float(avg_acceptance_length),
+    }
+
+    vocab_probability_histogram = finalize_vocab_probability_histogram_accumulator(
+        vocab_probability_hist_accumulator
+    )
+
+    if not records:
+        return {
+            "meta": meta,
+            "num_records": 0,
+            "distribution": {
+                "vocab_probability_histogram_by_position": vocab_probability_histogram,
+            },
+            "note": "No draft-token records were collected. This happens when block_size <= 1.",
+        }
+
+    top1_prob = np.asarray([r["top1_prob"] for r in records], dtype=np.float64)
+    entropy = np.asarray([r["entropy_nats"] for r in records], dtype=np.float64)
+    entropy_norm = np.asarray([r["normalized_entropy"] for r in records], dtype=np.float64)
+    effective_support = np.asarray([r["effective_support"] for r in records], dtype=np.float64)
+    block_position = np.asarray([r["block_position"] for r in records], dtype=np.int64)
+    positive_hit = np.asarray([r["positive_argmax_hit"] for r in records], dtype=np.float64)
+    accepted = np.asarray([r["accepted_by_target"] for r in records], dtype=np.float64)
+
+    top1_bands = {
+        "very_sharp_[0.9,1.0]": (top1_prob >= 0.9),
+        "sharp_[0.7,0.9)": (top1_prob >= 0.7) & (top1_prob < 0.9),
+        "medium_[0.5,0.7)": (top1_prob >= 0.5) & (top1_prob < 0.7),
+        "flat_[0.0,0.5)": (top1_prob < 0.5),
+    }
+    entropy_bands = {
+        "low_entropy_[0.0,0.4)": (entropy_norm >= 0.0) & (entropy_norm < 0.4),
+        "mid_entropy_[0.4,0.7)": (entropy_norm >= 0.4) & (entropy_norm < 0.7),
+        "high_entropy_[0.7,1.0]": (entropy_norm >= 0.7) & (entropy_norm <= 1.0000001),
+    }
+
+    total = max(1, int(top1_prob.size))
+    top1_band_stats = {
+        name: {
+            "count": int(mask.sum()),
+            "rate": float(mask.mean()),
+        }
+        for name, mask in top1_bands.items()
+    }
+    entropy_band_stats = {
+        name: {
+            "count": int(mask.sum()),
+            "rate": float(mask.mean()),
+        }
+        for name, mask in entropy_bands.items()
+    }
+
+    position_rows: list[dict[str, Any]] = []
+    for pos in sorted(int(x) for x in np.unique(block_position)):
+        mask = block_position == pos
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        position_rows.append(
+            {
+                "block_position": int(pos),
+                "count": count,
+                "rate": float(count / total),
+                "top1_prob": _describe_distribution(top1_prob[mask]),
+                "normalized_entropy": _describe_distribution(entropy_norm[mask]),
+                "effective_support": _describe_distribution(effective_support[mask]),
+            }
+        )
+
+    return {
+        "meta": meta,
+        "num_records": int(total),
+        "num_unique_samples": int(len(set(int(r["sample_idx"]) for r in records))),
+        "num_unique_turns": int(len(set((int(r["sample_idx"]), int(r["turn_idx"])) for r in records))),
+        "quick_quality_context": {
+            "positive_argmax_hit_rate": float(positive_hit.mean()),
+            "accepted_by_target_rate": float(accepted.mean()),
+        },
+        "distribution": {
+            "top1_prob": _describe_distribution(top1_prob),
+            "entropy_nats": _describe_distribution(entropy),
+            "normalized_entropy": _describe_distribution(entropy_norm),
+            "effective_support": _describe_distribution(effective_support),
+            "top1_prob_bands": top1_band_stats,
+            "entropy_bands": entropy_band_stats,
+            "histograms": {
+                "top1_prob": _build_histogram(top1_prob, bins=args.histogram_bins, value_range=(0.0, 1.0)),
+                "normalized_entropy": _build_histogram(entropy_norm, bins=args.histogram_bins, value_range=(0.0, 1.0)),
+            },
+            "block_position_profile": position_rows,
+            "vocab_probability_histogram_by_position": vocab_probability_histogram,
+        },
+    }
+
+
+def maybe_create_entropy_plots(
+    report_dir: Path,
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> list[str]:
+    if not records:
+        return []
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning(f"Skip plotting because matplotlib is unavailable: {exc}")
+        return []
+
+    top1_prob = np.asarray([r["top1_prob"] for r in records], dtype=np.float64)
+    entropy_norm = np.asarray([r["normalized_entropy"] for r in records], dtype=np.float64)
+    block_position = np.asarray([r["block_position"] for r in records], dtype=np.int64)
+
+    plot_files: list[str] = []
+
+    plt.figure(figsize=(8.0, 4.8))
+    plt.hist(top1_prob, bins=60, alpha=0.9, color="#4c72b0")
+    plt.xlabel("Top-1 probability (positive draft)")
+    plt.ylabel("Count")
+    plt.title("Distribution of Draft Top-1 Probability")
+    p1 = report_dir / "draft_top1_probability_hist.png"
+    plt.tight_layout()
+    plt.savefig(p1, dpi=160)
+    plt.close()
+    plot_files.append(p1.name)
+
+    plt.figure(figsize=(8.0, 4.8))
+    plt.hist(entropy_norm, bins=60, alpha=0.9, color="#c44e52")
+    plt.xlabel("Normalized entropy")
+    plt.ylabel("Count")
+    plt.title("Distribution of Draft Normalized Entropy")
+    p2 = report_dir / "draft_normalized_entropy_hist.png"
+    plt.tight_layout()
+    plt.savefig(p2, dpi=160)
+    plt.close()
+    plot_files.append(p2.name)
+
+    unique_positions = sorted(int(x) for x in np.unique(block_position))
+
+    def _plot_position_quantiles(values: np.ndarray, y_label: str, title: str, file_name: str) -> None:
+        if len(unique_positions) <= 1:
+            return
+
+        xs: list[int] = []
+        q10: list[float] = []
+        q25: list[float] = []
+        q50: list[float] = []
+        q75: list[float] = []
+        q90: list[float] = []
+
+        for pos in unique_positions:
+            mask = block_position == pos
+            pos_values = values[mask]
+            if pos_values.size == 0:
+                continue
+            xs.append(pos)
+            q = np.quantile(pos_values, [0.1, 0.25, 0.5, 0.75, 0.9])
+            q10.append(float(q[0]))
+            q25.append(float(q[1]))
+            q50.append(float(q[2]))
+            q75.append(float(q[3]))
+            q90.append(float(q[4]))
+
+        if len(xs) <= 1:
+            return
+
+        x_arr = np.asarray(xs, dtype=np.float64)
+        plt.figure(figsize=(8.2, 5.0))
+        plt.fill_between(x_arr, q10, q90, alpha=0.2, label="p10-p90", color="#4c72b0")
+        plt.fill_between(x_arr, q25, q75, alpha=0.3, label="p25-p75", color="#4c72b0")
+        plt.plot(x_arr, q50, marker="o", linewidth=2.0, label="median", color="#dd8452")
+        plt.xlabel("Block position")
+        plt.ylabel(y_label)
+        plt.title(title)
+        plt.xticks(xs)
+        plt.legend()
+        out = report_dir / file_name
+        plt.tight_layout()
+        plt.savefig(out, dpi=160)
+        plt.close()
+        plot_files.append(out.name)
+
+    _plot_position_quantiles(
+        top1_prob,
+        "Top-1 probability",
+        "Top-1 Probability by Block Position",
+        "draft_top1_probability_by_block_position.png",
+    )
+    _plot_position_quantiles(
+        entropy_norm,
+        "Normalized entropy",
+        "Normalized Entropy by Block Position",
+        "draft_normalized_entropy_by_block_position.png",
+    )
+
+    vocab_hist_rows = (
+        summary.get("distribution", {}).get("vocab_probability_histogram_by_position", [])
+    )
+    valid_vocab_hist_rows = [r for r in vocab_hist_rows if int(r.get("vocab_values", 0)) > 0]
+    if valid_vocab_hist_rows:
+        heatmap = np.asarray([r.get("rates", []) for r in valid_vocab_hist_rows], dtype=np.float64)
+        if heatmap.ndim == 2 and heatmap.shape[0] > 0 and heatmap.shape[1] > 0:
+            positions = [int(r.get("block_position", i + 1)) for i, r in enumerate(valid_vocab_hist_rows)]
+            bin_edges = np.asarray(valid_vocab_hist_rows[0].get("bin_edges", []), dtype=np.float64)
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:]) if bin_edges.size > 1 else np.array([])
+
+            plt.figure(figsize=(9.0, 5.5))
+            plt.imshow(heatmap.T, aspect="auto", origin="lower", cmap="magma")
+            plt.colorbar(label="Mean histogram rate")
+            plt.xlabel("Block position")
+            plt.ylabel("Probability bin")
+            plt.title("Mean Vocab-Probability Histogram by Block Position")
+            plt.xticks(np.arange(len(positions)), positions)
+            if bin_centers.size > 0:
+                yticks = np.linspace(0, len(bin_centers) - 1, num=min(6, len(bin_centers)), dtype=int)
+                ylabels = [f"{bin_centers[i]:.3f}" for i in yticks]
+                plt.yticks(yticks, ylabels)
+            out = report_dir / "draft_vocab_probability_histogram_by_position.png"
+            plt.tight_layout()
+            plt.savefig(out, dpi=160)
+            plt.close()
+            plot_files.append(out.name)
+
+    return plot_files
+
+
+def write_entropy_report_md(
+    report_path: Path,
+    summary: dict[str, Any],
+    records: list[dict[str, Any]],
+    plot_files: list[str],
+) -> None:
+    lines: list[str] = []
+    lines.append("# Draft Output Probability Shape")
+    lines.append("")
+
+    if summary.get("num_records", 0) == 0:
+        lines.append("No draft entropy records were collected.")
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    quality = summary.get("quick_quality_context", {})
+    dist = summary.get("distribution", {})
+    top1 = dist.get("top1_prob", {})
+    entropy_norm = dist.get("normalized_entropy", {})
+    effective_support = dist.get("effective_support", {})
+    top1_bands = dist.get("top1_prob_bands", {})
+    entropy_bands = dist.get("entropy_bands", {})
+    position_profile = dist.get("block_position_profile", [])
+    vocab_prob_hist = dist.get("vocab_probability_histogram_by_position", [])
+
+    lines.append("## Overall")
+    lines.append(f"- Number of draft-token records: **{summary['num_records']}**")
+    lines.append(f"- Decoding speedup (bs=1 vs bs=block): **{summary.get('meta', {}).get('decoding_speedup', 0.0):.2f}x**")
+    lines.append(f"- Average acceptance length: **{summary.get('meta', {}).get('avg_acceptance_length', 0.0):.2f}**")
+    lines.append(f"- Positive argmax hit rate (context): **{quality.get('positive_argmax_hit_rate', 0.0) * 100:.2f}%**")
+    lines.append(f"- Accepted-by-target rate (context): **{quality.get('accepted_by_target_rate', 0.0) * 100:.2f}%**")
+    lines.append("")
+
+    lines.append("## Core Distribution Stats")
+    lines.append(
+        f"- Top-1 probability mean / median / p90: **{top1.get('mean', 0.0):.4f} / {top1.get('median', 0.0):.4f} / {top1.get('p90', 0.0):.4f}**"
+    )
+    lines.append(
+        f"- Normalized entropy mean / median / p90: **{entropy_norm.get('mean', 0.0):.4f} / {entropy_norm.get('median', 0.0):.4f} / {entropy_norm.get('p90', 0.0):.4f}**"
+    )
+    lines.append(
+        f"- Effective support mean / median / p90: **{effective_support.get('mean', 0.0):.4f} / {effective_support.get('median', 0.0):.4f} / {effective_support.get('p90', 0.0):.4f}**"
+    )
+    lines.append("")
+
+    lines.append("## Top-1 Probability Bands")
+    lines.append("| Band | Count | Rate |")
+    lines.append("|---|---:|---:|")
+    for name, row in top1_bands.items():
+        lines.append(f"| {name} | {row['count']} | {row['rate'] * 100:.2f}% |")
+    lines.append("")
+
+    lines.append("## Normalized-Entropy Bands")
+    lines.append("| Band | Count | Rate |")
+    lines.append("|---|---:|---:|")
+    for name, row in entropy_bands.items():
+        lines.append(f"| {name} | {row['count']} | {row['rate'] * 100:.2f}% |")
+    lines.append("")
+
+    if position_profile:
+        lines.append("## Position-wise Distribution (Within Block)")
+        lines.append("| block_pos | count | rate | top1 median | normalized-entropy median | effective-support median |")
+        lines.append("|---:|---:|---:|---:|---:|---:|")
+        for row in position_profile:
+            top1_stats = row.get("top1_prob", {})
+            entropy_stats = row.get("normalized_entropy", {})
+            support_stats = row.get("effective_support", {})
+            lines.append(
+                f"| {row['block_position']} | {row['count']} | {row['rate'] * 100:.2f}% | {top1_stats.get('median', 0.0):.4f} | {entropy_stats.get('median', 0.0):.4f} | {support_stats.get('median', 0.0):.3f} |"
+            )
+        lines.append("")
+
+    valid_vocab_hist = [r for r in vocab_prob_hist if int(r.get("vocab_values", 0)) > 0]
+    if valid_vocab_hist:
+        lines.append("## Mean Histogram of Full-Vocabulary Probabilities (Positions 1-15)")
+        lines.append("| block_pos | distributions | vocab_values | mass in first bin | mass in last bin |")
+        lines.append("|---:|---:|---:|---:|---:|")
+        for row in valid_vocab_hist:
+            rates = row.get("rates", [])
+            first_bin = float(rates[0]) if rates else 0.0
+            last_bin = float(rates[-1]) if rates else 0.0
+            lines.append(
+                f"| {int(row.get('block_position', 0))} | {int(row.get('num_distributions', 0))} | {int(row.get('vocab_values', 0))} | {first_bin * 100:.4f}% | {last_bin * 100:.4f}% |"
+            )
+        lines.append("")
+        lines.append(
+            "Detailed per-bin values are saved in `draft_vocab_probability_hist_by_position.csv` and `draft_entropy_summary.json`."
+        )
+        lines.append("")
+
+    lines.append("## Interpreting Sharp vs Flat")
+    lines.append(
+        "- More sharp: higher top1 probability, lower normalized entropy, lower effective support."
+    )
+    lines.append(
+        "- More flat: lower top1 probability, higher normalized entropy, higher effective support."
+    )
+    lines.append(
+        f"- Quick ratio (top1>=0.7 vs top1<0.5): **{(top1_bands.get('very_sharp_[0.9,1.0]', {}).get('rate', 0.0) + top1_bands.get('sharp_[0.7,0.9)', {}).get('rate', 0.0)) * 100:.2f}% vs {top1_bands.get('flat_[0.0,0.5)', {}).get('rate', 0.0) * 100:.2f}%**"
+    )
+    lines.append("")
+
+    if plot_files:
+        lines.append("## Plots")
+        for name in plot_files:
+            lines.append(f"![{name}]({name})")
+        lines.append("")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
 @torch.inference_mode()
 def dflash_generate(
     model: DFlashDraftModel,
@@ -971,6 +1098,7 @@ def dflash_generate(
     negative_hidden_mode: str = "mask_zero",
     divergence_accumulator: Optional[List[float]] = None,
     draft_entropy_records: Optional[List[dict[str, Any]]] = None,
+    vocab_probability_hist_accumulator: Optional[dict[str, Any]] = None,
     sample_idx: int = -1,
     turn_idx: int = -1,
     seed: int = 0,
@@ -1051,6 +1179,7 @@ def dflash_generate(
                     reference_logits=positive_draft_logits,
                     top_k=64,
                 )
+            
                         
             final_draft_logits = apply_cd_logits(
                 first_logits=positive_draft_logits,
@@ -1097,6 +1226,7 @@ def dflash_generate(
                 turn_idx=turn_idx,
                 decode_step=decode_step,
                 block_start=start,
+                vocab_probability_hist_accumulator=vocab_probability_hist_accumulator,
             )
 
         acceptance_lengths.append(acceptance_length+1)
@@ -1144,8 +1274,6 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--report-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--max-example-rows", type=int, default=20)
-    parser.add_argument("--calibration-bins", type=int, default=10)
     parser.add_argument("--histogram-bins", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cd-alpha", type=float, default=0.05)
@@ -1218,8 +1346,12 @@ def main() -> None:
     if args.max_samples is not None and len(dataset) > args.max_samples:
         dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
-    divergence_accumulator: List[float] = [] 
+    divergence_accumulator: List[float] = []
     draft_entropy_records: List[dict[str, Any]] = []
+    vocab_probability_hist_accumulator = init_vocab_probability_histogram_accumulator(
+        max_positions=15,
+        bins=args.histogram_bins,
+    )
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
@@ -1235,8 +1367,7 @@ def main() -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            decode_block_sizes = [1] if block_size == 1 else [1, block_size]
-            for bs in decode_block_sizes:
+            for bs in [1, block_size]:
                 response[bs] = dflash_generate(
                     model=draft_model,
                     target=target,
@@ -1251,8 +1382,9 @@ def main() -> None:
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
                     negative_hidden_mode=args.negative_hidden_mode,
-                    divergence_accumulator = divergence_accumulator if bs == block_size else None,
+                    divergence_accumulator=divergence_accumulator if bs == block_size else None,
                     draft_entropy_records=draft_entropy_records if bs == block_size else None,
+                    vocab_probability_hist_accumulator=vocab_probability_hist_accumulator if bs == block_size else None,
                     sample_idx=idx,
                     turn_idx=turn_index,
                     seed = sample_seed + bs,
@@ -1268,11 +1400,15 @@ def main() -> None:
         responses = dist.gather(responses, dst=0)
         divergence_accumulator = dist.gather(divergence_accumulator, dst=0)
         draft_entropy_records = dist.gather(draft_entropy_records, dst=0)
+        vocab_probability_hist_accumulator = dist.gather(vocab_probability_hist_accumulator, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
         divergence_accumulator = list(chain(*divergence_accumulator))
         draft_entropy_records = list(chain(*draft_entropy_records))
+        vocab_probability_hist_accumulator = merge_vocab_probability_histogram_accumulators(
+            vocab_probability_hist_accumulator
+        )
 
     if not responses:
         print("No responses were generated.")
@@ -1303,15 +1439,21 @@ def main() -> None:
         block_size=block_size,
         decoding_speedup=float(t1 / tb),
         avg_acceptance_length=float(tau),
+        vocab_probability_hist_accumulator=vocab_probability_hist_accumulator,
     )
 
     records_jsonl = report_dir / "draft_entropy_records.jsonl"
     records_csv = report_dir / "draft_entropy_records.csv"
+    vocab_hist_csv = report_dir / "draft_vocab_probability_hist_by_position.csv"
     summary_json = report_dir / "draft_entropy_summary.json"
     report_md = report_dir / "draft_entropy_report.md"
 
     write_jsonl(records_jsonl, draft_entropy_records)
     write_csv(records_csv, draft_entropy_records)
+    write_vocab_probability_histogram_csv(
+        vocab_hist_csv,
+        entropy_summary.get("distribution", {}).get("vocab_probability_histogram_by_position", []),
+    )
     summary_json.write_text(json.dumps(entropy_summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     plot_files = [] if args.no_plots else maybe_create_entropy_plots(report_dir, draft_entropy_records, entropy_summary)
@@ -1320,30 +1462,34 @@ def main() -> None:
         summary=entropy_summary,
         records=draft_entropy_records,
         plot_files=plot_files,
-        max_rows=args.max_example_rows,
     )
 
     print(f"Draft entropy records: {entropy_summary.get('num_records', 0)}")
     if entropy_summary.get("num_records", 0) > 0:
-        top1_mean = entropy_summary["confidence"]["top1_prob"]["mean"]
-        ent_norm_mean = entropy_summary["entropy"]["normalized_entropy"]["mean"]
-        ece = entropy_summary["calibration"]["ece"]
-        hit_rate = entropy_summary["rates"]["positive_argmax_hit_rate"]
-        rejected_focus = entropy_summary.get("rejected_token_focus", {})
-        rejected_rate = rejected_focus.get("rejected_rate", 0.0)
-        rejected_ent_norm_mean = rejected_focus.get("normalized_entropy", {}).get("mean", 0.0)
-        rejected_top1_mean = rejected_focus.get("top1_prob", {}).get("mean", 0.0)
-        print(f"Positive argmax hit rate: {hit_rate * 100:.2f}%")
+        quality = entropy_summary.get("quick_quality_context", {})
+        dist_stats = entropy_summary.get("distribution", {})
+        top1_mean = dist_stats.get("top1_prob", {}).get("mean", 0.0)
+        ent_norm_mean = dist_stats.get("normalized_entropy", {}).get("mean", 0.0)
+        support_mean = dist_stats.get("effective_support", {}).get("mean", 0.0)
+        hit_rate = quality.get("positive_argmax_hit_rate", 0.0)
+        accepted_rate = quality.get("accepted_by_target_rate", 0.0)
+        top1_bands = dist_stats.get("top1_prob_bands", {})
+        very_sharp = top1_bands.get("very_sharp_[0.9,1.0]", {}).get("rate", 0.0)
+        sharp = top1_bands.get("sharp_[0.7,0.9)", {}).get("rate", 0.0)
+        flat = top1_bands.get("flat_[0.0,0.5)", {}).get("rate", 0.0)
+        print(f"Positive argmax hit rate (context): {hit_rate * 100:.2f}%")
+        print(f"Accepted-by-target rate (context): {accepted_rate * 100:.2f}%")
         print(f"Mean top1 probability: {top1_mean:.4f}")
         print(f"Mean normalized entropy: {ent_norm_mean:.4f}")
-        print(f"Calibration ECE: {ece:.5f}")
-        print(f"Rejected token rate: {rejected_rate * 100:.2f}%")
-        print(f"Rejected mean normalized entropy: {rejected_ent_norm_mean:.4f}")
-        print(f"Rejected mean top1 probability: {rejected_top1_mean:.4f}")
+        print(f"Mean effective support: {support_mean:.4f}")
+        print(
+            f"Sharpness check (top1>=0.7 vs top1<0.5): {(very_sharp + sharp) * 100:.2f}% vs {flat * 100:.2f}%"
+        )
 
     print(f"Report directory: {report_dir}")
     print(f"  - {records_jsonl.name}")
     print(f"  - {records_csv.name}")
+    print(f"  - {vocab_hist_csv.name}")
     print(f"  - {summary_json.name}")
     print(f"  - {report_md.name}")
     if plot_files:

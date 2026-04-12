@@ -26,7 +26,8 @@ A part of highest attention score token in target hidden is mask to make negativ
 """
 
 def cuda_time() -> float:
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -186,6 +187,38 @@ def apply_cd_candidate_filter(
     )
     return filtered_logits
 
+
+def soften_logits_for_contrastive(
+    logits: torch.Tensor,
+    temperature: float,
+    uniform_mix: float,
+    min_prob: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Soften token distribution before contrastive decoding.
+
+    - temperature > 1.0 flattens distribution
+    - uniform_mix blends with uniform prior to avoid over-confident peaks
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    if not (0.0 <= uniform_mix < 1.0):
+        raise ValueError(f"uniform_mix must be in [0, 1), got {uniform_mix}")
+    if not (0.0 < min_prob < 1.0):
+        raise ValueError(f"min_prob must be in (0, 1), got {min_prob}")
+
+    scaled_logits = logits.float() / temperature
+    probs = torch.softmax(scaled_logits, dim=-1)
+
+    if uniform_mix > 0.0:
+        vocab_size = probs.size(-1)
+        uniform_prob = 1.0 / float(vocab_size)
+        probs = (1.0 - uniform_mix) * probs + uniform_mix * uniform_prob
+
+    probs = probs.clamp_min(min_prob)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return torch.log(probs)
+
 def _compute_kl_divergence(
     first_logits: torch.Tensor,
     second_logits: torch.Tensor,
@@ -241,6 +274,12 @@ def dflash_generate(
     negative_context_noise_std: float = 0.0,
     negative_hidden_mode: str = "mask_zero",
     divergence_accumulator: Optional[List[float]] = None,
+    cdv2_soften: bool = True,
+    cdv2_soften_temperature: float = 1.25,
+    cdv2_soften_uniform_mix: float = 0.03,
+    cdv2_soften_min_prob: float = 1e-8,
+    cdv2_candidate_mask_source: str = "softened",
+    cdv2_nkeep_source: str = "softened",
     seed: int = 0,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
@@ -302,26 +341,56 @@ def dflash_generate(
                 gen=gen
             )
             past_key_values_draft.crop(start)
+
+            raw_positive_draft_logits = positive_draft_logits
+            raw_negative_draft_logits = negative_draft_logits
+
+            positive_logits_for_cd = raw_positive_draft_logits.float()
+            negative_logits_for_cd = raw_negative_draft_logits.float()
+
+            if cdv2_soften:
+                positive_logits_for_cd = soften_logits_for_contrastive(
+                    logits=positive_logits_for_cd,
+                    temperature=cdv2_soften_temperature,
+                    uniform_mix=cdv2_soften_uniform_mix,
+                    min_prob=cdv2_soften_min_prob,
+                )
+                negative_logits_for_cd = soften_logits_for_contrastive(
+                    logits=negative_logits_for_cd,
+                    temperature=cdv2_soften_temperature,
+                    uniform_mix=cdv2_soften_uniform_mix,
+                    min_prob=cdv2_soften_min_prob,
+                )
+
+            if cdv2_soften and cdv2_candidate_mask_source == "softened":
+                candidate_reference_logits = positive_logits_for_cd
+            else:
+                candidate_reference_logits = raw_positive_draft_logits
+
+            if cdv2_soften and cdv2_nkeep_source == "softened":
+                nkeep_reference_logits = positive_logits_for_cd
+            else:
+                nkeep_reference_logits = raw_positive_draft_logits
             
             # ----- Divergence witness (optional) -----
             if divergence_accumulator is not None:
-                kl_val = _compute_kl_divergence(positive_draft_logits, negative_draft_logits)
+                kl_val = _compute_kl_divergence(positive_logits_for_cd, negative_logits_for_cd)
                 divergence_accumulator.append(kl_val)
 
             if not TOP64_MASK_MODE:
                 candidate_mask = build_cd_candidate_mask(
-                    reference_logits=positive_draft_logits,
+                    reference_logits=candidate_reference_logits,
                     beta=beta,
                 )
             else:
                 candidate_mask = build_topk_probability_mask(
-                    reference_logits=positive_draft_logits,
+                    reference_logits=candidate_reference_logits,
                     top_k=64,
                 )
                         
             final_draft_logits = apply_cd_logits(
-                first_logits=positive_draft_logits,
-                second_logits=negative_draft_logits,
+                first_logits=positive_logits_for_cd,
+                second_logits=negative_logits_for_cd,
                 alpha=cd_alpha,
             )
             
@@ -332,7 +401,7 @@ def dflash_generate(
             
             # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
             n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            final_draft_logits[:, :n_keep, :] = nkeep_reference_logits[:, :n_keep, :]
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -397,6 +466,44 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cd-alpha", type=float, default=0.05)
     parser.add_argument("--cd-beta", type=float, default=0.0)
+    parser.add_argument(
+        "--cdv2-soften",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable probability softening before applying contrastive logits.",
+    )
+    parser.add_argument(
+        "--cdv2-soften-temperature",
+        type=float,
+        default=1.25,
+        help="Temperature for pre-contrastive softening; >1.0 flattens distribution.",
+    )
+    parser.add_argument(
+        "--cdv2-soften-uniform-mix",
+        type=float,
+        default=0.03,
+        help="Blend ratio with uniform prior for pre-contrastive softening.",
+    )
+    parser.add_argument(
+        "--cdv2-soften-min-prob",
+        type=float,
+        default=1e-8,
+        help="Numerical floor for probabilities during softening.",
+    )
+    parser.add_argument(
+        "--cdv2-candidate-mask-source",
+        type=str,
+        choices=["softened", "raw"],
+        default="softened",
+        help="Which logits to use for candidate-mask construction.",
+    )
+    parser.add_argument(
+        "--cdv2-nkeep-source",
+        type=str,
+        choices=["softened", "raw"],
+        default="softened",
+        help="Which logits to keep for first n_keep positions after contrastive combination.",
+    )
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
@@ -414,8 +521,24 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+
+    if args.cdv2_soften_temperature <= 0.0:
+        raise ValueError(f"--cdv2-soften-temperature must be > 0, got {args.cdv2_soften_temperature}")
+    if not (0.0 <= args.cdv2_soften_uniform_mix < 1.0):
+        raise ValueError(f"--cdv2-soften-uniform-mix must be in [0, 1), got {args.cdv2_soften_uniform_mix}")
+    if not (0.0 < args.cdv2_soften_min_prob < 1.0):
+        raise ValueError(f"--cdv2-soften-min-prob must be in (0, 1), got {args.cdv2_soften_min_prob}")
+
     NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
     print(f"Using negative hidden mode: [bold magenta]{args.negative_hidden_mode}[/bold magenta]")
+    print(
+        "CDv2 soften config: "
+        f"[bold cyan]enabled={args.cdv2_soften}, "
+        f"temperature={args.cdv2_soften_temperature}, "
+        f"uniform_mix={args.cdv2_soften_uniform_mix}, "
+        f"mask_source={args.cdv2_candidate_mask_source}, "
+        f"nkeep_source={args.cdv2_nkeep_source}[/bold cyan]"
+    )
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -493,6 +616,12 @@ def main() -> None:
                     temperature=args.temperature,
                     cd_alpha=args.cd_alpha,
                     beta=args.cd_beta,
+                    cdv2_soften=args.cdv2_soften,
+                    cdv2_soften_temperature=args.cdv2_soften_temperature,
+                    cdv2_soften_uniform_mix=args.cdv2_soften_uniform_mix,
+                    cdv2_soften_min_prob=args.cdv2_soften_min_prob,
+                    cdv2_candidate_mask_source=args.cdv2_candidate_mask_source,
+                    cdv2_nkeep_source=args.cdv2_nkeep_source,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
                     negative_hidden_mode=args.negative_hidden_mode,

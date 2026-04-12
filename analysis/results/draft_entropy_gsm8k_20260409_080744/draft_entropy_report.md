@@ -34,6 +34,44 @@
 - Top-1 probability mean / median / p90: **0.6429 / 0.6640 / 0.9997**
 - Top-1 margin mean / median / p90: **0.5195 / 0.4860 / 0.9995**
 
+## Distribution Shape (Vocabulary Sharpness)
+Interpreting sharpness:
+- Higher `top1_prob` and lower `effective_support` imply a more peaked token distribution.
+
+### Top-1 Probability Bands
+| Band | Count | Rate | Mean top1 | Mean support | Mean entropy | Local hit rate | Accepted rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| very_sharp_[0.9,1.0] | 30514 | 33.71% | 0.9817 | 1.115 | 0.0995 | 94.26% | 77.39% |
+| sharp_[0.7,0.9) | 12462 | 13.77% | 0.8041 | 2.249 | 0.7741 | 67.43% | 35.27% |
+| medium_[0.5,0.7) | 13897 | 15.35% | 0.5954 | 4.164 | 1.3382 | 48.41% | 18.88% |
+| flat_[0.0,0.5) | 33652 | 37.17% | 0.2955 | 19.981 | 2.6392 | 24.02% | 4.37% |
+
+### Effective-Support Bands
+| Band | Count | Rate | Mean top1 | Mean support | Mean entropy | Local hit rate | Accepted rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| very_sharp_[1,2] | 36511 | 40.33% | 0.9564 | 1.220 | 0.1748 | 90.79% | 71.87% |
+| moderate_[2,10) | 32748 | 36.18% | 0.5573 | 4.700 | 1.4394 | 45.38% | 16.65% |
+| diffuse_[10,+inf) | 21266 | 23.49% | 0.2363 | 27.927 | 3.1305 | 18.64% | 1.95% |
+
+## Position-wise Distribution (Within Block)
+| block_pos | count | rate | top1 median | entropy median (nats) | support median | top1>=0.9 | support<=2 | local hit | accepted |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 6035 | 6.67% | 0.9839 | 0.1021 | 1.108 | 67.72% | 77.73% | 88.70% | 88.68% |
+| 2 | 6035 | 6.67% | 0.9481 | 0.2675 | 1.307 | 56.80% | 65.17% | 80.66% | 74.70% |
+| 3 | 6035 | 6.67% | 0.8920 | 0.4783 | 1.613 | 49.20% | 57.15% | 73.97% | 62.00% |
+| 4 | 6035 | 6.67% | 0.8400 | 0.6345 | 1.886 | 44.29% | 52.00% | 69.58% | 52.61% |
+| 5 | 6035 | 6.67% | 0.7659 | 0.7965 | 2.218 | 39.54% | 46.66% | 64.18% | 44.74% |
+| 6 | 6035 | 6.67% | 0.6986 | 0.9661 | 2.628 | 35.76% | 42.60% | 61.16% | 37.83% |
+| 7 | 6035 | 6.67% | 0.6838 | 1.0145 | 2.758 | 34.10% | 40.89% | 57.98% | 32.33% |
+| 8 | 6035 | 6.67% | 0.6464 | 1.1274 | 3.088 | 31.67% | 38.34% | 55.03% | 28.24% |
+| 9 | 6035 | 6.67% | 0.5941 | 1.2721 | 3.568 | 28.38% | 34.63% | 51.65% | 24.29% |
+| 10 | 6035 | 6.67% | 0.5594 | 1.4002 | 4.056 | 25.85% | 32.49% | 49.33% | 20.80% |
+| 11 | 6035 | 6.67% | 0.5261 | 1.5414 | 4.671 | 23.53% | 29.54% | 47.27% | 17.95% |
+| 12 | 6035 | 6.67% | 0.4860 | 1.6645 | 5.283 | 21.03% | 26.33% | 44.21% | 15.24% |
+| 13 | 6035 | 6.67% | 0.4580 | 1.8092 | 6.105 | 18.61% | 23.10% | 42.00% | 12.87% |
+| 14 | 6035 | 6.67% | 0.4240 | 1.9389 | 6.951 | 15.79% | 20.60% | 39.19% | 10.75% |
+| 15 | 6035 | 6.67% | 0.3765 | 2.1431 | 8.526 | 13.36% | 17.75% | 36.32% | 8.96% |
+
 ## Correlation
 - corr(top1_prob, positive_hit): **0.6158**
 - corr(normalized_entropy, positive_hit): **-0.5920**
@@ -68,6 +106,10 @@
 ![draft_rejected_top1_probability_hist.png](draft_rejected_top1_probability_hist.png)
 ![draft_reliability_diagram.png](draft_reliability_diagram.png)
 ![draft_confidence_vs_entropy_scatter.png](draft_confidence_vs_entropy_scatter.png)
+![draft_top1_probability_by_block_position.png](draft_top1_probability_by_block_position.png)
+![draft_entropy_nats_by_block_position.png](draft_entropy_nats_by_block_position.png)
+![draft_effective_support_by_block_position.png](draft_effective_support_by_block_position.png)
+![draft_top1_probability_position_density.png](draft_top1_probability_position_density.png)
 
 ## Highest-Entropy Rejected Tokens
 | sample | turn | step | pos | block_pos | entropy | top1_prob | top1_margin | hit | accepted | target_id | top1_id | sampled_id |

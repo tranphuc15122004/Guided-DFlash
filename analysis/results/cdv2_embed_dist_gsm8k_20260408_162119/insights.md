@@ -33,6 +33,18 @@ Cần nhấn mạnh: đây là phân tích **token-level shadow** trên quỹ đ
 | score-only nudge trên reachable wrong | `18,364 / 21,140 = 86.87%` | target logprob tăng nhưng rank không đổi |
 | reachable wrong có `candidate_size <= 6` | `12,096 / 21,140 = 57.22%` | hơn nửa case bị “đóng băng” về mặt cơ chế |
 
+### 2.1. Thống kê khoảng cách embedding theo 3 trường hợp yêu cầu
+
+| Nhóm case | Count | Rate | L2 mean | L2 median | L2 p90 | CosDist mean | CosDist median | CosDist p90 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cải thiện: `improved_push_to_top1` | `0` | `0.00%` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` |
+| Làm tệ đi: target từ top-1 drop xuống (`worsened_drop_from_top1`) | `0` | `0.00%` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` |
+| Làm tệ đi: target không đẩy được lên (`worsened_not_push_to_top1`) | `38,625` | `42.65%` | `1.5411` | `1.5492` | `1.6997` | `1.0320` | `1.0156` | `1.1489` |
+
+Ghi chú:
+
+- Với run này, 2 nhóm `improved_push_to_top1` và `worsened_drop_from_top1` đều có count bằng 0, nên thống kê khoảng cách embedding của hai nhóm đó không khả dụng.
+
 Kết luận ngắn nhất của run này là:
 
 - Thay `first_token` của negative sample **có perturb negative branch**.

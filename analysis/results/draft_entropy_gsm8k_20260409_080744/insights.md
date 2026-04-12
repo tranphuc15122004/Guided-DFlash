@@ -1,5 +1,77 @@
 # Phân tích insight cho run `draft_entropy_gsm8k_20260409_080744`
 
+## Đọc nhanh (1 phút)
+
+Nếu bạn chỉ cần kết luận chính, đọc 5 dòng này trước:
+
+1. Entropy và confidence dự đoán **đúng/sai cục bộ** rất tốt.
+2. `accepted_by_target` không thuần local, vì bị ảnh hưởng bởi **prefix truncation** trong block.
+3. `rejected` là tập trộn: có cả token sai thật (`rejected_wrong`) và token đúng cục bộ nhưng vẫn bị reject (`rejected_hit`).
+4. `block_position` là biến nhiễu mạnh: càng về cuối block, entropy tăng và accepted rate giảm.
+5. Muốn debug failure thật thì ưu tiên nhóm `rejected_wrong`, không nên gom toàn bộ `rejected`.
+
+Các số quan trọng nhất:
+
+- Local hit rate (`positive_argmax_hit`): **57.42%**
+- Accepted-by-target rate: **35.47%**
+- Rejected-only ECE: **0.1598** (xấu hơn overall ECE = **0.0705**)
+- Mean entropy accepted vs rejected: **0.336** vs **1.871** nats
+- Mean entropy local-hit vs local-wrong: **0.706** vs **2.164** nats
+
+## Bổ sung kiểm định phân phối xác suất theo vị trí
+
+Đã bổ sung trực tiếp các biểu đồ position-wise trong report chính:
+
+- `draft_top1_probability_by_block_position.png`
+- `draft_entropy_nats_by_block_position.png`
+- `draft_effective_support_by_block_position.png`
+- `draft_top1_probability_position_density.png`
+
+Bạn có thể mở nhanh tại:
+
+- `analysis/results/draft_entropy_gsm8k_20260409_080744/draft_entropy_report.md`
+
+### Kết luận trực tiếp cho câu hỏi “phân phối có nhọn hay không?”
+
+Không có một trạng thái cố định. Phân phối chuyển từ **nhọn** sang **bẹt hơn** khi đi dần về cuối block:
+
+- Block pos 1: median top1 = **0.9839**, median entropy = **0.1021**, median effective support = **1.108**
+- Block pos 15: median top1 = **0.3765**, median entropy = **2.1431**, median effective support = **8.526**
+
+Diễn giải:
+
+- đầu block: rất peaked (độ chắc cao, support hẹp)
+- cuối block: phân phối dẹt hơn rõ rệt (độ chắc giảm, support rộng hơn)
+
+### Kết luận định lượng theo toàn bộ token
+
+Theo band của `top1_prob`:
+
+- very sharp (`>= 0.9`): **33.71%**
+- flat (`< 0.5`): **37.17%**
+
+Theo band của `effective_support`:
+
+- very sharp (`<= 2`): **40.33%**
+- diffuse (`>= 10`): **23.49%**
+
+Điều này xác nhận mục tiêu kiểm định: draft không “luôn nhọn” cũng không “luôn bẹt”; nó là hỗn hợp nhiều chế độ và phụ thuộc mạnh vào `block_position`.
+
+## Từ điển thuật ngữ (đọc trước khi vào chi tiết)
+
+- `positive_argmax_hit`: đúng/sai **cục bộ tại đúng token đó**. Top-1 draft có trùng token posterior hay không.
+- `accepted_by_target`: token có nằm trong **accepted prefix** hay không.
+- `rejected_hit`: token bị reject theo prefix, nhưng local vẫn đúng (`accepted_by_target = 0`, `positive_argmax_hit = 1`).
+- `rejected_wrong`: token bị reject và local cũng sai (`accepted_by_target = 0`, `positive_argmax_hit = 0`).
+- `entropy_nats`: độ bất định của phân phối token. Cao hơn nghĩa là mô hình kém chắc chắn hơn.
+- `effective_support`: xấp xỉ số lựa chọn "đang còn sống" của phân phối (gần 1 là rất peaked).
+
+## Cách đọc theo mục tiêu
+
+- Nếu bạn muốn đánh giá local quality của draft: ưu tiên `positive_argmax_hit`, entropy, top1 probability.
+- Nếu bạn muốn đánh giá hành vi speculative accept: xem `accepted_by_target` nhưng luôn tách theo `block_position`.
+- Nếu bạn muốn debug lỗi mô hình: tập trung vào `rejected_wrong` trước, sau đó mới xem `rejected_hit`.
+
 ## 1. Phạm vi và cách đọc đúng của folder này
 
 Nguồn dùng để phân tích:
