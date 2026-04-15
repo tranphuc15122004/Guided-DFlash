@@ -1,0 +1,45 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=16
+#PBS -l mem=24GB
+#PBS -l walltime=01:30:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+mkdir -p logs
+
+LOG_FILE="logs/cdv2_model_entropy_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export PYTHONPATH="$PWD"
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
+mkdir -p "$HF_HOME"
+
+python - <<'PY'
+import torch
+print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cxx11abi', torch.compiled_with_cxx11_abi())
+try:
+    import flash_attn
+    print('flash_attn', flash_attn.__version__)
+except Exception as exc:
+    print('flash_attn unavailable:', exc)
+PY
+
+python -u -m analysis.CDv2_check_model_entropy \
+  --model-name-or-path Qwen/Qwen3-4B \
+  --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset gsm8k \
+  --max-samples 128 \
+  --max-new-tokens 2048 \
+  --no-plots \
+  --no-deterministic

@@ -1,10 +1,16 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+MASTER_PORT=${MASTER_PORT:-29600}
+EXTRA_BENCHMARK_ARGS=${EXTRA_BENCHMARK_ARGS:-}
 
 mkdir -p logs
 
-TASKS=(
-  "gsm8k:128"
-)
+if [[ -n "${TASKS_OVERRIDE:-}" ]]; then
+  TASKS=("${TASKS_OVERRIDE}")
+else
+  TASKS=(
+    "gsm8k:128"
+  )
+fi
 
 for task in "${TASKS[@]}"; do
   IFS=':' read -r DATASET_NAME MAX_SAMPLES <<< "$task"
@@ -14,15 +20,16 @@ for task in "${TASKS[@]}"; do
   echo "========================================================"
 
   torchrun \
-    --nproc_per_node=1 \
-    --master_port=29600 \
-    -m scheme.CD_v2 \
+    --nproc_per_node=${NPROC_PER_NODE} \
+    --master_port=${MASTER_PORT} \
+    -m benchmark \
     --dataset "$DATASET_NAME" \
     --max-samples "$MAX_SAMPLES" \
     --model-name-or-path Qwen/Qwen3-4B \
     --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
     --max-new-tokens 2048 \
     --temperature 0.0 \
+    ${EXTRA_BENCHMARK_ARGS} \
     2>&1 | tee "logs/${DATASET_NAME}.log"
 
 done

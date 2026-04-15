@@ -1,0 +1,15 @@
+/local/spool/pbs/mom_priv/jobs/165709310.gadi-pbs.SC: line 18: /scratch/jp09/dd9648/venvs/dflash/bin/activate: No such file or directory
+
+======================================================================================
+                  Resource Usage on 2026-04-15 13:35:23:
+   Job Id:             165709310.gadi-pbs
+   Project:            hn98
+   Exit Status:        1
+   Service Units:      0.22
+   NCPUs Requested:    12                  CPU Time Used: 00:00:02        
+   Memory Requested:   24.0GB                Memory Used: 160.66MB        
+   NGPUs Requested:    1                 GPU Utilisation: 0%              
+                                         GPU Memory Used: 0B              
+   Walltime Requested: 00:10:00            Walltime Used: 00:00:22        
+   JobFS Requested:    100.0MB                JobFS Used: 0B              
+======================================================================================

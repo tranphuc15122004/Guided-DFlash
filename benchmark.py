@@ -180,6 +180,11 @@ def main() -> None:
     torch.cuda.set_device(dist.local_rank())
     device = torch.device(f"cuda:{dist.local_rank()}")
 
+    supports_bf16 = torch.cuda.is_bf16_supported() if hasattr(torch.cuda, "is_bf16_supported") else False
+    model_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+    if not supports_bf16:
+        logger.info("CUDA device does not support bfloat16. Falling back to float16.")
+
     def has_flash_attn():
         if args.deterministic:
             logger.info("Deterministic mode enabled. Forcing SDPA attention backend.")
@@ -196,13 +201,13 @@ def main() -> None:
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
     ).to(device).eval()
 
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
         attn_implementation="flash_attention_2" if installed_flash_attn else "sdpa",
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
     ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
