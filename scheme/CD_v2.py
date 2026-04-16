@@ -321,7 +321,6 @@ def dflash_generate(
                     top_k=64,
                 )
             
-                        
             final_draft_logits = apply_cd_logits(
                 first_logits=positive_draft_logits,
                 second_logits=negative_draft_logits,
@@ -334,8 +333,8 @@ def dflash_generate(
             )
             
             # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
-            n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            """ n_keep = min(6, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -398,7 +397,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", type=float, default=0.05)
+    parser.add_argument("--cd-alpha", type=float, default=0.1)
     parser.add_argument("--cd-beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)

@@ -2,9 +2,9 @@
 #PBS -P hn98
 #PBS -q gpuhopper
 #PBS -l ngpus=1
-#PBS -l ncpus=16
+#PBS -l ncpus=12
 #PBS -l mem=24GB
-#PBS -l walltime=01:30:00
+#PBS -l walltime=00:40:00
 #PBS -l storage=scratch/jp09+gdata/hn98
 #PBS -j oe
 
@@ -42,4 +42,5 @@ python -u -m analysis.CDv2_check_model_entropy \
   --max-samples 128 \
   --max-new-tokens 2048 \
   --no-plots \
-  --no-deterministic
+  --no-deterministic \
+  --entropy-logit-source negative 

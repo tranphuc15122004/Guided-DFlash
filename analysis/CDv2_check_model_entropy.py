@@ -41,6 +41,21 @@ def build_report_dir(dataset_name: str, report_dir: Optional[str]) -> Path:
     return path
 
 
+def select_entropy_logits(
+    positive_logits: torch.Tensor,
+    negative_logits: torch.Tensor,
+    entropy_logit_source: str,
+) -> torch.Tensor:
+    if entropy_logit_source == "positive":
+        return positive_logits
+    if entropy_logit_source == "negative":
+        return negative_logits
+    raise ValueError(
+        f"Unsupported entropy_logit_source={entropy_logit_source}. "
+        "Use 'positive' or 'negative'."
+    )
+
+
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for rec in records:
@@ -487,7 +502,8 @@ def log_logits_difference(
 def _collect_draft_entropy_records(
     *,
     records: list[dict[str, Any]],
-    positive_logits: torch.Tensor,
+    analysis_logits: torch.Tensor,
+    logits_source: str,
     sampled_draft_ids: torch.Tensor,
     posterior_ids: torch.Tensor,
     acceptance_lengths: torch.Tensor,
@@ -497,10 +513,10 @@ def _collect_draft_entropy_records(
     block_start: int,
     vocab_probability_hist_accumulator: Optional[dict[str, Any]] = None,
 ) -> None:
-    if positive_logits.numel() == 0:
+    if analysis_logits.numel() == 0:
         return
 
-    logits = positive_logits.float()
+    logits = analysis_logits.float()
     probs = torch.softmax(logits, dim=-1)
     log_probs = torch.log_softmax(logits, dim=-1)
 
@@ -532,7 +548,7 @@ def _collect_draft_entropy_records(
         for i in range(num_steps):
             sampled_id = int(sampled_draft_ids[b, i].item())
             target_id = int(posterior_ids[b, i].item())
-            positive_top1_id = int(top1_ids[b, i].item())
+            analyzed_top1_id = int(top1_ids[b, i].item())
             sampled_match = int(sampled_id == target_id)
             accepted_by_target = int(i < accepted_len)
 
@@ -543,12 +559,13 @@ def _collect_draft_entropy_records(
                     "decode_step": int(decode_step),
                     "absolute_position": int(block_start + i + 1),
                     "block_position": int(i + 1),
+                    "logits_source": logits_source,
                     "sampled_draft_id": sampled_id,
                     "target_token_id": target_id,
-                    "positive_top1_id": positive_top1_id,
+                    "analyzed_top1_id": analyzed_top1_id,
                     "sampled_matches_target": sampled_match,
                     "accepted_by_target": accepted_by_target,
-                    "positive_argmax_hit": int(positive_top1_id == target_id),
+                    "analyzed_argmax_hit": int(analyzed_top1_id == target_id),
                     "entropy_nats": float(entropy[b, i].item()),
                     "entropy_bits": float(entropy_bits[b, i].item()),
                     "normalized_entropy": float(entropy_norm[b, i].item()),
@@ -560,8 +577,8 @@ def _collect_draft_entropy_records(
                     "top10_mass": float(top10_mass[b, i].item()),
                     "target_prob": float(target_prob[b, i].item()),
                     "target_logprob": float(target_logprob[b, i].item()),
-                    "sampled_prob_under_positive": float(sampled_prob[b, i].item()),
-                    "sampled_logprob_under_positive": float(sampled_logprob[b, i].item()),
+                    "sampled_prob_under_analyzed": float(sampled_prob[b, i].item()),
+                    "sampled_logprob_under_analyzed": float(sampled_logprob[b, i].item()),
                     "target_minus_sampled_prob": float((target_prob[b, i] - sampled_prob[b, i]).item()),
                 }
             )
@@ -739,6 +756,7 @@ def build_entropy_summary(
         "negative_context_dropout": float(args.negative_context_dropout),
         "negative_context_noise_std": float(args.negative_context_noise_std),
         "negative_hidden_mode": args.negative_hidden_mode,
+        "entropy_logit_source": args.entropy_logit_source,
         "top64_mask_mode": bool(TOP64_MASK_MODE),
         "decoding_speedup": float(decoding_speedup),
         "avg_acceptance_length": float(avg_acceptance_length),
@@ -763,7 +781,7 @@ def build_entropy_summary(
     entropy_norm = np.asarray([r["normalized_entropy"] for r in records], dtype=np.float64)
     effective_support = np.asarray([r["effective_support"] for r in records], dtype=np.float64)
     block_position = np.asarray([r["block_position"] for r in records], dtype=np.int64)
-    positive_hit = np.asarray([r["positive_argmax_hit"] for r in records], dtype=np.float64)
+    analyzed_hit = np.asarray([r["analyzed_argmax_hit"] for r in records], dtype=np.float64)
     accepted = np.asarray([r["accepted_by_target"] for r in records], dtype=np.float64)
 
     top1_bands = {
@@ -817,7 +835,7 @@ def build_entropy_summary(
         "num_unique_samples": int(len(set(int(r["sample_idx"]) for r in records))),
         "num_unique_turns": int(len(set((int(r["sample_idx"]), int(r["turn_idx"])) for r in records))),
         "quick_quality_context": {
-            "positive_argmax_hit_rate": float(positive_hit.mean()),
+            "analyzed_argmax_hit_rate": float(analyzed_hit.mean()),
             "accepted_by_target_rate": float(accepted.mean()),
         },
         "distribution": {
@@ -862,9 +880,9 @@ def maybe_create_entropy_plots(
 
     plt.figure(figsize=(8.0, 4.8))
     plt.hist(top1_prob, bins=60, alpha=0.9, color="#4c72b0")
-    plt.xlabel("Top-1 probability (positive draft)")
+    plt.xlabel("Top-1 probability (analyzed logits)")
     plt.ylabel("Count")
-    plt.title("Distribution of Draft Top-1 Probability")
+    plt.title("Distribution of Draft Top-1 Probability (Analyzed)")
     p1 = report_dir / "draft_top1_probability_hist.png"
     plt.tight_layout()
     plt.savefig(p1, dpi=160)
@@ -988,6 +1006,7 @@ def write_entropy_report_md(
 
     quality = summary.get("quick_quality_context", {})
     dist = summary.get("distribution", {})
+    meta = summary.get("meta", {})
     top1 = dist.get("top1_prob", {})
     entropy_norm = dist.get("normalized_entropy", {})
     effective_support = dist.get("effective_support", {})
@@ -998,9 +1017,10 @@ def write_entropy_report_md(
 
     lines.append("## Overall")
     lines.append(f"- Number of draft-token records: **{summary['num_records']}**")
+    lines.append(f"- Entropy logits source: **{meta.get('entropy_logit_source', 'positive')}**")
     lines.append(f"- Decoding speedup (bs=1 vs bs=block): **{summary.get('meta', {}).get('decoding_speedup', 0.0):.2f}x**")
     lines.append(f"- Average acceptance length: **{summary.get('meta', {}).get('avg_acceptance_length', 0.0):.2f}**")
-    lines.append(f"- Positive argmax hit rate (context): **{quality.get('positive_argmax_hit_rate', 0.0) * 100:.2f}%**")
+    lines.append(f"- Analyzed argmax hit rate (context): **{quality.get('analyzed_argmax_hit_rate', 0.0) * 100:.2f}%**")
     lines.append(f"- Accepted-by-target rate (context): **{quality.get('accepted_by_target_rate', 0.0) * 100:.2f}%**")
     lines.append("")
 
@@ -1096,6 +1116,7 @@ def dflash_generate(
     negative_context_dropout: float = 0.3,
     negative_context_noise_std: float = 0.0,
     negative_hidden_mode: str = "mask_zero",
+    entropy_logit_source: str = "positive",
     divergence_accumulator: Optional[List[float]] = None,
     draft_entropy_records: Optional[List[dict[str, Any]]] = None,
     vocab_probability_hist_accumulator: Optional[dict[str, Any]] = None,
@@ -1216,9 +1237,15 @@ def dflash_generate(
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
         if block_size > 1 and draft_entropy_records is not None:
+            entropy_logits = select_entropy_logits(
+                positive_logits=positive_draft_logits,
+                negative_logits=negative_draft_logits,
+                entropy_logit_source=entropy_logit_source,
+            )
             _collect_draft_entropy_records(
                 records=draft_entropy_records,
-                positive_logits=positive_draft_logits,
+                analysis_logits=entropy_logits,
+                logits_source=entropy_logit_source,
                 sampled_draft_ids=block_output_ids[:, 1:],
                 posterior_ids=posterior[:, :-1],
                 acceptance_lengths=acceptance_lengths_per_batch,
@@ -1280,6 +1307,13 @@ def main() -> None:
     parser.add_argument("--cd-beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
+    parser.add_argument(
+        "--entropy-logit-source",
+        type=str,
+        choices=["positive", "negative"],
+        default="positive",
+        help="Select which draft logits are analyzed for entropy/statistics.",
+    )
     parser.add_argument(
         "--negative-hidden-mode",
         type=str,
@@ -1382,6 +1416,7 @@ def main() -> None:
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
                     negative_hidden_mode=args.negative_hidden_mode,
+                    entropy_logit_source=args.entropy_logit_source,
                     divergence_accumulator=divergence_accumulator if bs == block_size else None,
                     draft_entropy_records=draft_entropy_records if bs == block_size else None,
                     vocab_probability_hist_accumulator=vocab_probability_hist_accumulator if bs == block_size else None,
@@ -1468,16 +1503,18 @@ def main() -> None:
     if entropy_summary.get("num_records", 0) > 0:
         quality = entropy_summary.get("quick_quality_context", {})
         dist_stats = entropy_summary.get("distribution", {})
+        source_name = entropy_summary.get("meta", {}).get("entropy_logit_source", "positive")
         top1_mean = dist_stats.get("top1_prob", {}).get("mean", 0.0)
         ent_norm_mean = dist_stats.get("normalized_entropy", {}).get("mean", 0.0)
         support_mean = dist_stats.get("effective_support", {}).get("mean", 0.0)
-        hit_rate = quality.get("positive_argmax_hit_rate", 0.0)
+        hit_rate = quality.get("analyzed_argmax_hit_rate", 0.0)
         accepted_rate = quality.get("accepted_by_target_rate", 0.0)
         top1_bands = dist_stats.get("top1_prob_bands", {})
         very_sharp = top1_bands.get("very_sharp_[0.9,1.0]", {}).get("rate", 0.0)
         sharp = top1_bands.get("sharp_[0.7,0.9)", {}).get("rate", 0.0)
         flat = top1_bands.get("flat_[0.0,0.5)", {}).get("rate", 0.0)
-        print(f"Positive argmax hit rate (context): {hit_rate * 100:.2f}%")
+        print(f"Analyzed logits source: {source_name}")
+        print(f"Analyzed argmax hit rate (context): {hit_rate * 100:.2f}%")
         print(f"Accepted-by-target rate (context): {accepted_rate * 100:.2f}%")
         print(f"Mean top1 probability: {top1_mean:.4f}")
         print(f"Mean normalized entropy: {ent_norm_mean:.4f}")

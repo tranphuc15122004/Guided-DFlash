@@ -8,3 +8,4 @@ jobs/
 wandb/
 logs/
 analysis/results/**/*.jsonl
+alpha_adjusting/results/
