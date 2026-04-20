@@ -3,3 +3,4 @@ accelerate
 rich
 packaging
 ninja
+matplotlib
