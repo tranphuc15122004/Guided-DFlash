@@ -9,3 +9,5 @@ wandb/
 logs/
 analysis/results/**/*.jsonl
 alpha_adjusting/results/
+alpha_model/collected_alpha_records
+STDIN.o*

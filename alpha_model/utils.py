@@ -1,6 +1,9 @@
+import os
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable, Dict, Optional, Union
 
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
 
 
 def _reasoning_prompt(text: str) -> str:
@@ -143,6 +146,143 @@ DATASET_CONFIG: Dict[str, dict] = {
 
 AUTO_STREAM_DATASETS = {"math_instruct", "metamath", "magicoder"}
 
+LOCAL_MIRROR_FILENAMES = {
+    "math_instruct": ["MathInstruct.json", "MathInstruct.jsonl"],
+    "metamath": ["MetaMathQA-395K.json", "MetaMathQA.json", "MetaMathQA-395K.jsonl"],
+    "magicoder": ["Magicoder-Evol-Instruct-110K.json", "Magicoder-Evol-Instruct-110K.jsonl"],
+}
+
+HF_OFFLINE_ENV_VARS = (
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "HF_DATASETS_OFFLINE",
+    "HF_DATASETS_OFFLINE_MODE",
+)
+
+
+def _is_truthy_env(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_offline_env_enabled() -> bool:
+    for key in HF_OFFLINE_ENV_VARS:
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        lowered = value.strip().lower()
+        if key == "HF_DATASETS_OFFLINE_MODE":
+            # "auto" can still force offline behavior depending on runtime context.
+            if lowered not in {"", "0", "false", "no", "off"}:
+                return True
+            continue
+        if _is_truthy_env(value):
+            return True
+    return False
+
+
+def _looks_like_offline_error(exc: Exception) -> bool:
+    msg = str(exc)
+    lowered = msg.lower()
+    return "offlinemodeisenabled" in lowered or "offline mode" in lowered
+
+
+@contextmanager
+def _temporarily_disable_hf_offline_env():
+    saved = {key: os.environ.get(key) for key in HF_OFFLINE_ENV_VARS}
+    for key in HF_OFFLINE_ENV_VARS:
+        if key == "HF_DATASETS_OFFLINE_MODE":
+            os.environ[key] = "0"
+        else:
+            os.environ[key] = "0"
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def _temporarily_disable_hf_offline_runtime():
+    """
+    Disable offline mode in both env vars and Hugging Face runtime constants.
+    Some libraries cache offline flags at import time, so env-only changes are insufficient.
+    """
+    datasets_config = None
+    hub_constants = None
+    saved_datasets_offline = None
+    saved_hub_offline = None
+
+    try:
+        from datasets import config as datasets_config  # type: ignore
+        saved_datasets_offline = getattr(datasets_config, "HF_DATASETS_OFFLINE", None)
+        if hasattr(datasets_config, "HF_DATASETS_OFFLINE"):
+            datasets_config.HF_DATASETS_OFFLINE = False
+    except Exception:
+        datasets_config = None
+
+    try:
+        from huggingface_hub import constants as hub_constants  # type: ignore
+        saved_hub_offline = getattr(hub_constants, "HF_HUB_OFFLINE", None)
+        if hasattr(hub_constants, "HF_HUB_OFFLINE"):
+            hub_constants.HF_HUB_OFFLINE = False
+    except Exception:
+        hub_constants = None
+
+    with _temporarily_disable_hf_offline_env():
+        try:
+            yield
+        finally:
+            if datasets_config is not None and saved_datasets_offline is not None:
+                datasets_config.HF_DATASETS_OFFLINE = saved_datasets_offline
+            if hub_constants is not None and saved_hub_offline is not None:
+                hub_constants.HF_HUB_OFFLINE = saved_hub_offline
+
+
+def _load_dataset_with_offline_fallback(**kwargs):
+    try:
+        return load_dataset(**kwargs)
+    except Exception as exc:
+        if _looks_like_offline_error(exc):
+            print(
+                "[WARN] HF offline mode detected while loading dataset; "
+                "retrying once with offline flags/runtime disabled. "
+                f"offline_env={_has_offline_env_enabled()}"
+            )
+            with _temporarily_disable_hf_offline_runtime():
+                retry_kwargs = dict(kwargs)
+                # Ensure retry is not forced into local-files-only behavior.
+                if retry_kwargs.get("download_config") is None:
+                    retry_kwargs["download_config"] = DownloadConfig(local_files_only=False)
+                else:
+                    retry_kwargs["download_config"].local_files_only = False
+                return load_dataset(**retry_kwargs)
+        raise
+
+
+def _iter_local_dataset_candidates(data_name: str, split: str, use_streaming: bool):
+    mirror_dirs = []
+    for env_key in ("ALPHA_DATASET_DIR", "HF_DATASET_MIRROR_DIR"):
+        env_value = os.environ.get(env_key, "").strip()
+        if env_value:
+            mirror_dirs.append(Path(env_value).expanduser())
+
+    filenames = LOCAL_MIRROR_FILENAMES.get(data_name, [])
+    for mirror_dir in mirror_dirs:
+        for filename in filenames:
+            candidate_file = mirror_dir / filename
+            if candidate_file.is_file():
+                yield {
+                    "path": "json",
+                    "data_files": {split: str(candidate_file)},
+                    "split": split,
+                    "streaming": use_streaming,
+                }
+
 
 def _resolve_streaming_mode(data_name: str, streaming: Union[bool, str]) -> bool:
     if streaming == "auto":
@@ -169,7 +309,33 @@ def _build_load_kwargs(data_name: str, split: Optional[str], use_streaming: bool
 
 def _load_dataset_with_fallback(kwargs: dict, data_name: str):
     if data_name != "math_full":
-        return load_dataset(**kwargs)
+        try:
+            return _load_dataset_with_offline_fallback(**kwargs)
+        except Exception as hub_exc:
+            split = kwargs.get("split", "train")
+            use_streaming = bool(kwargs.get("streaming", False))
+
+            last_local_exc = None
+            for local_kwargs in _iter_local_dataset_candidates(data_name, split, use_streaming):
+                try:
+                    print(
+                        f"[WARN] Hub load failed for {data_name}; "
+                        f"trying local mirror file: {local_kwargs['data_files'][split]}"
+                    )
+                    return _load_dataset_with_offline_fallback(**local_kwargs)
+                except Exception as local_exc:
+                    last_local_exc = local_exc
+
+            if data_name in LOCAL_MIRROR_FILENAMES:
+                expected = ", ".join(LOCAL_MIRROR_FILENAMES[data_name])
+                raise RuntimeError(
+                    f"Unable to load dataset '{data_name}' from Hub and local mirrors. "
+                    f"Expected one of [{expected}] under ALPHA_DATASET_DIR or HF_DATASET_MIRROR_DIR. "
+                    "If running with restricted network, provide a local mirror path or clear offline flags "
+                    "(HF_HUB_OFFLINE/HF_DATASETS_OFFLINE/HF_DATASETS_OFFLINE_MODE)."
+                ) from (last_local_exc or hub_exc)
+
+            raise
 
     # Keep a few known aliases because MATH mirrors on HF occasionally move.
     math_candidates = [
@@ -188,7 +354,7 @@ def _load_dataset_with_fallback(kwargs: dict, data_name: str):
                 candidate_kwargs.pop("name", None)
             else:
                 candidate_kwargs["name"] = candidate["name"]
-            return load_dataset(**candidate_kwargs)
+            return _load_dataset_with_offline_fallback(**candidate_kwargs)
         except Exception as exc:
             last_error = exc
 
@@ -316,19 +482,33 @@ def load_and_process_dataset_ALPHA(
             dataset = dataset.skip(start_index)
         if num_instances is not None:
             dataset = dataset.take(num_instances)
-    else:
-        if start_index > 0 or num_instances is not None:
-            end_index = len(dataset) if num_instances is None else start_index + num_instances
-            start = min(start_index, len(dataset))
-            end = min(end_index, len(dataset))
-            dataset = dataset.select(range(start, end))
-
-    if max_samples is not None:
-        if max_samples <= 0:
-            raise ValueError(f"max_samples must be > 0, got {max_samples}")
-        if use_streaming:
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError(f"max_samples must be > 0, got {max_samples}")
             dataset = dataset.take(max_samples)
+    else:
+        # Non-streaming: handle start_index and num_instances first
+        dataset_len = len(dataset)
+        
+        # Validate start_index
+        if start_index >= dataset_len:
+            # Return empty dataset instead of crashing
+            dataset = dataset.select([])
         else:
+            # Apply start_index and num_instances
+            if start_index > 0 or num_instances is not None:
+                end_index = dataset_len if num_instances is None else start_index + num_instances
+                start = start_index
+                end = min(end_index, dataset_len)
+                if start < end:
+                    dataset = dataset.select(range(start, end))
+                else:
+                    dataset = dataset.select([])
+        
+        # Then apply max_samples on the already-sliced dataset
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError(f"max_samples must be > 0, got {max_samples}")
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
     if use_streaming:

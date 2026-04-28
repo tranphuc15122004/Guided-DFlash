@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from itertools import chain
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from loguru import logger
 import numpy as np
 import torch
@@ -27,6 +27,16 @@ python alpha_model/data_collecting.py \
   --collector-output-dir alpha_model/collected_alpha_records \
   --collector-topk 32 \
   --collector-chunk-size 2048
+"""
+
+"""
+Dataset:
+- gsm8k (math): 7,473                   -> 7,473
+- metamath (math): 395,000              -> 20.000
+- math_instruct (math): 262,039         -> 5.000
+- magicoder (code): 111,183             -> 20.000
+
+In total: 52,473
 """
 
 
@@ -52,6 +62,7 @@ class BlockRecordWriter:
         if not self.buffer:
             return
         out_file = self.output_dir / f"rank_{self.rank:02d}_chunk_{self.chunk_index:05d}.pt"
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.buffer, out_file)
         self.buffer.clear()
         self.chunk_index += 1
@@ -60,8 +71,45 @@ class BlockRecordWriter:
         self.flush()
 
 
+def _dataset_length(dataset: Any) -> Optional[int]:
+    try:
+        return len(dataset)
+    except TypeError:
+        return None
+
+
+def _iter_dataset_for_rank(dataset: Any, rank: int, world_size: int) -> Iterator[Tuple[int, dict]]:
+    for idx, instance in enumerate(dataset):
+        if idx % world_size != rank:
+            continue
+        yield idx, instance
+
+
+def _estimate_total_for_rank(
+    dataset_len: Optional[int],
+    num_instances: Optional[int],
+    max_samples: Optional[int],
+    rank: int,
+    world_size: int,
+) -> Optional[int]:
+    total = dataset_len
+    if total is None:
+        if num_instances is not None:
+            total = num_instances
+        elif max_samples is not None:
+            total = max_samples
+
+    if total is None:
+        return None
+
+    total = max(0, int(total))
+    remaining = max(0, total - rank)
+    return (remaining + world_size - 1) // world_size
+
+
 def cuda_time() -> float:
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -550,7 +598,7 @@ def main() -> None:
     parser.add_argument(
         "--deterministic",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
@@ -602,7 +650,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset_ALPHA(
         args.dataset,
-        streaming=False,
+        streaming="auto",
         start_index=args.start_index,
         num_instances=args.num_instances,
         max_samples=args.max_samples,
@@ -618,12 +666,29 @@ def main() -> None:
         )
 
     responses = []
-    indices = range(dist.rank(), len(dataset), dist.size())
+    world_size = dist.size()
+    rank = dist.rank()
+    dataset_len = _dataset_length(dataset)
+    total_for_rank = _estimate_total_for_rank(
+        dataset_len=dataset_len,
+        num_instances=args.num_instances,
+        max_samples=args.max_samples,
+        rank=rank,
+        world_size=world_size,
+    )
     
     base_seed = args.seed
-    for idx in tqdm(indices, disable=not dist.is_main()):
+    dataset_iterator = _iter_dataset_for_rank(dataset, rank, world_size)
+    progress = tqdm(
+        dataset_iterator,
+        total=total_for_rank,
+        disable=not dist.is_main(),
+        desc=f"collect[{args.dataset}] rank{rank}",
+        unit="sample",
+        dynamic_ncols=True,
+    )
+    for idx, instance in progress:
         sample_seed = base_seed + idx + dist.rank() * 10_000_000
-        instance = dataset[idx]
         messages = []
         for turn_index, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})

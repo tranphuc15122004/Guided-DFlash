@@ -58,6 +58,12 @@ def build_negative_block_output_random(block_output_ids: torch.Tensor, vocab_siz
     negative_block_output_ids[:, 0] = random_tokens
     return negative_block_output_ids
 
+def build_negative_block_output_mask(block_output_ids: torch.Tensor, mask_token : int , vocab_size: int , gen : torch.Generator = None) -> torch.Tensor:
+    negative_block_output_ids = block_output_ids.clone()
+    batch_size = block_output_ids.shape[0]
+    negative_block_output_ids[:, 0] = mask_token
+    return negative_block_output_ids
+
 def build_negative_target_hidden(
     target_hidden: torch.Tensor,
     dropout_ratio: float = 0.3,
@@ -111,6 +117,7 @@ def compute_contrastive_draft_logits(
     draft_position_ids: torch.Tensor,
     past_key_values_draft: DynamicCache,
     block_size: int,
+    mask_token : int,
     negative_context_dropout: float,
     negative_context_noise_std: float,
     negative_hidden_mode: str,
@@ -119,6 +126,8 @@ def compute_contrastive_draft_logits(
     batch_size = block_output_ids.shape[0]
     
     neg_block_output_ids = build_negative_block_output_random(block_output_ids, target.config.vocab_size , gen)
+    #neg_block_output_ids = build_negative_block_output_mask (block_output_ids , mask_token , target.config.vocab_size , gen)
+    
     negative_target_hidden = build_negative_target_hidden(
         target_hidden=target_hidden,
         dropout_ratio=negative_context_dropout,
@@ -298,6 +307,7 @@ def dflash_generate(
                 draft_position_ids=draft_position_ids,
                 past_key_values_draft=past_key_values_draft,
                 block_size=block_size,
+                mask_token = mask_token_id,
                 negative_context_dropout=negative_context_dropout,
                 negative_context_noise_std=negative_context_noise_std,
                 negative_hidden_mode=negative_hidden_mode,
@@ -333,8 +343,8 @@ def dflash_generate(
             )
             
             # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
-            """ n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
+            n_keep = min(6, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -397,7 +407,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", type=float, default=0.1)
+    parser.add_argument("--cd-alpha", type=float, default=0.6)
     parser.add_argument("--cd-beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)

@@ -21,7 +21,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from analysis import token_level_core
 from analysis import token_level_reporting
-from model import DFlashDraftModel, apply_vcd_logits, extract_context_feature, load_and_process_dataset, sample
+from model import DFlashDraftModel, apply_cd_logits, extract_context_feature, load_and_process_dataset, sample
+
+
+NEGATIVE_HIDDEN_MODE = "mask_zero"
+TOP64_MASK_MODE = False
+FINAL_OVERRIDE_KEEP = 7
+COMPARE_NAME = "CDv2"
 
 
 def cuda_time() -> float:
@@ -65,14 +71,47 @@ def build_negative_target_hidden(
     target_hidden: torch.Tensor,
     dropout_ratio: float = 0.3,
     noise_std: float = 0.0,
+    mode: str = "mask_zero",
     gen: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    return token_level_core.build_negative_target_hidden(
-        target_hidden=target_hidden,
-        dropout_ratio=dropout_ratio,
-        noise_std=noise_std,
-        gen=gen,
-    )
+    negative_target_hidden = target_hidden.clone()
+    batch_size, context_len = negative_target_hidden.shape[:2]
+
+    if mode == "mask_zero":
+        if dropout_ratio > 0.0:
+            token_keep_mask = (
+                torch.rand(
+                    negative_target_hidden.shape[:2],
+                    device=negative_target_hidden.device,
+                    generator=gen,
+                )
+                >= dropout_ratio
+            ).unsqueeze(-1)
+            negative_target_hidden = negative_target_hidden.masked_fill(~token_keep_mask, 0.0)
+    elif mode == "shuffle_tokens":
+        if context_len > 1:
+            per_batch_indices = []
+            for _ in range(batch_size):
+                perm = torch.randperm(context_len, device=negative_target_hidden.device, generator=gen)
+                per_batch_indices.append(perm)
+            gather_index = torch.stack(per_batch_indices, dim=0).unsqueeze(-1).expand(-1, -1, negative_target_hidden.shape[-1])
+            negative_target_hidden = torch.gather(negative_target_hidden, dim=1, index=gather_index)
+    else:
+        raise ValueError(
+            f"Unsupported negative hidden mode: {mode}. "
+            "Use 'mask_zero' or 'shuffle_tokens'."
+        )
+
+    if noise_std > 0.0:
+        noise = torch.randn(
+            negative_target_hidden.shape,
+            dtype=negative_target_hidden.dtype,
+            device=negative_target_hidden.device,
+            generator=gen,
+        )
+        negative_target_hidden = negative_target_hidden + noise_std * noise
+
+    return negative_target_hidden
 
 
 def compute_contrastive_draft_logits(
@@ -85,27 +124,64 @@ def compute_contrastive_draft_logits(
     block_size: int,
     negative_context_dropout: float,
     negative_context_noise_std: float,
+    negative_hidden_mode: str,
     gen: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return token_level_core.compute_contrastive_draft_logits(
-        model=model,
-        target=target,
+    batch_size = block_output_ids.shape[0]
+    neg_block_output_ids = build_negative_block_output_random(
         block_output_ids=block_output_ids,
+        vocab_size=target.config.vocab_size,
+        gen=gen,
+    )
+    negative_target_hidden = build_negative_target_hidden(
         target_hidden=target_hidden,
-        draft_position_ids=draft_position_ids,
-        past_key_values_draft=past_key_values_draft,
-        block_size=block_size,
-        negative_context_dropout=negative_context_dropout,
-        negative_context_noise_std=negative_context_noise_std,
+        dropout_ratio=negative_context_dropout,
+        noise_std=negative_context_noise_std,
+        mode=negative_hidden_mode,
         gen=gen,
     )
 
+    positive_noise_embedding = target.model.embed_tokens(block_output_ids)
+    negative_noise_embedding = target.model.embed_tokens(neg_block_output_ids)
 
-def build_vcd_candidate_mask(reference_logits: torch.Tensor, beta: float) -> torch.Tensor:
+    paired_noise_embedding = torch.cat([positive_noise_embedding, negative_noise_embedding], dim=0)
+    paired_hidden = torch.cat([target_hidden, negative_target_hidden], dim=0)
+    paired_position_ids = torch.cat([draft_position_ids, draft_position_ids], dim=0)
+
+    paired_draft_logits = target.lm_head(
+        model(
+            target_hidden=paired_hidden,
+            noise_embedding=paired_noise_embedding,
+            position_ids=paired_position_ids,
+            past_key_values=past_key_values_draft,
+            use_cache=True,
+            is_causal=False,
+        )[:, -block_size + 1 :, :]
+    )
+
+    first_draft_logits, second_draft_logits = paired_draft_logits.split(batch_size, dim=0)
+    return first_draft_logits, second_draft_logits
+
+
+def build_cd_candidate_mask(reference_logits: torch.Tensor, beta: float) -> torch.Tensor:
     return token_level_core.build_candidate_mask(reference_logits=reference_logits, beta=beta)
 
 
-def apply_vcd_candidate_filter(logits: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
+def build_topk_probability_mask(
+    reference_logits: torch.Tensor,
+    top_k: int = 64,
+) -> torch.Tensor:
+    reference_probs = torch.softmax(reference_logits, dim=-1)
+    vocab_size = reference_probs.size(-1)
+    k = min(max(1, top_k), vocab_size)
+
+    topk_indices = torch.topk(reference_probs, k=k, dim=-1).indices
+    topk_mask = torch.zeros_like(reference_probs, dtype=torch.bool)
+    topk_mask.scatter_(-1, topk_indices, True)
+    return topk_mask
+
+
+def apply_cd_candidate_filter(logits: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
     return token_level_core.apply_candidate_filter(logits=logits, candidate_mask=candidate_mask)
 
 
@@ -168,7 +244,7 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def _maybe_create_plots(report_dir: Path, records: list[dict[str, Any]]) -> list[str]:
-    return token_level_reporting.maybe_create_plots(report_dir, records, compare_name="VCD")
+    return token_level_reporting.maybe_create_plots(report_dir, records, compare_name=COMPARE_NAME)
 
 
 def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, block_size: int) -> dict[str, Any]:
@@ -177,12 +253,12 @@ def _build_summary(records: list[dict[str, Any]], args: argparse.Namespace, bloc
         dataset=args.dataset,
         seed=args.seed,
         block_size=block_size,
-        alpha=args.vcd_alpha,
-        beta=args.vcd_beta,
-        shadow_num_samples=args.vcd_shadow_num_samples,
+        alpha=args.cd_alpha,
+        beta=args.cd_beta,
+        shadow_num_samples=args.cd_shadow_num_samples,
         negative_context_dropout=args.negative_context_dropout,
         negative_context_noise_std=args.negative_context_noise_std,
-        compare_name="VCD",
+        compare_name=COMPARE_NAME,
     )
 
 
@@ -199,7 +275,7 @@ def _write_report_md(
         records=records,
         plot_files=plot_files,
         max_rows=max_rows,
-        compare_name="VCD",
+        compare_name=COMPARE_NAME,
     )
 
 
@@ -214,13 +290,14 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
-    vcd_alpha: float = 1.0,
+    cd_alpha: float = 1.0,
     beta: float = 0.1,
     negative_context_dropout: float = 0.3,
     negative_context_noise_std: float = 0.0,
+    negative_hidden_mode: str = "mask_zero",
     divergence_accumulator: Optional[List[float]] = None,
     reject_records: Optional[list[dict[str, Any]]] = None,
-    vcd_shadow_num_samples: int = 1,
+    cd_shadow_num_samples: int = 1,
     sample_idx: int = -1,
     turn_idx: int = -1,
     seed: int = 0,
@@ -274,6 +351,7 @@ def dflash_generate(
                 block_size=block_size,
                 negative_context_dropout=negative_context_dropout,
                 negative_context_noise_std=negative_context_noise_std,
+                negative_hidden_mode=negative_hidden_mode,
                 gen=gen,
             )
             past_key_values_draft.crop(start)
@@ -281,18 +359,24 @@ def dflash_generate(
             if divergence_accumulator is not None:
                 divergence_accumulator.append(_compute_kl_divergence(positive_draft_logits, negative_draft_logits))
 
-            candidate_mask = build_vcd_candidate_mask(reference_logits=positive_draft_logits, beta=beta)
-            final_draft_logits = apply_vcd_logits(
+            if not TOP64_MASK_MODE:
+                candidate_mask = build_cd_candidate_mask(reference_logits=positive_draft_logits, beta=beta)
+            else:
+                candidate_mask = build_topk_probability_mask(reference_logits=positive_draft_logits, top_k=64)
+
+            final_draft_logits = apply_cd_logits(
                 first_logits=positive_draft_logits,
                 second_logits=negative_draft_logits,
-                alpha=vcd_alpha,
+                alpha=cd_alpha,
             )
-            final_draft_logits = apply_vcd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
-            positive_sampled_tokens = sample(positive_draft_logits, gen=gen)
-            vcd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)
+            final_draft_logits = apply_cd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
 
-            # Keep original rollout trajectory; VCD is evaluated in shadow mode.
-            block_output_ids[:, 1:] = positive_sampled_tokens
+            # Match CDv2 rollout behavior by overriding early positions with positive logits.
+            n_keep = min(FINAL_OVERRIDE_KEEP, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+
+            block_output_ids[:, 1:] = sample(final_draft_logits, gen=gen)
+            cd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)
             if draft_prefill:
                 draft_prefill = False
                 decode_start = cuda_time()
@@ -312,10 +396,10 @@ def dflash_generate(
             reject_offset = acceptance_length
             target_token_id = int(posterior[0, reject_offset].item())
             sampled_draft_id = int(block_output_ids[0, reject_offset + 1].item())
-            vcd_shadow_sampled_id = int(vcd_shadow_sampled_tokens[0, reject_offset].item())
+            cd_shadow_sampled_id = int(cd_shadow_sampled_tokens[0, reject_offset].item())
 
             positive_step_logits = positive_draft_logits[0, reject_offset, :].float()
-            vcd_step_logits = final_draft_logits[0, reject_offset, :].float()
+            cd_step_logits = final_draft_logits[0, reject_offset, :].float()
             posterior_step_logits = output.logits[0, reject_offset, :].float()
 
             reject_records.append(
@@ -328,12 +412,12 @@ def dflash_generate(
                     reject_offset=reject_offset,
                     target_token_id=target_token_id,
                     sampled_draft_id=sampled_draft_id,
-                    shadow_sampled_id=vcd_shadow_sampled_id,
+                    shadow_sampled_id=cd_shadow_sampled_id,
                     positive_step_logits=positive_step_logits,
-                    contrastive_step_logits=vcd_step_logits,
+                    contrastive_step_logits=cd_step_logits,
                     posterior_step_logits=posterior_step_logits,
                     candidate_mask_step=candidate_mask[0, reject_offset, :],
-                    shadow_num_samples=vcd_shadow_num_samples,
+                    shadow_num_samples=cd_shadow_num_samples,
                     gen=gen,
                 )
             )
@@ -377,6 +461,8 @@ def dflash_generate(
 
 
 def main() -> None:
+    global NEGATIVE_HIDDEN_MODE, TOP64_MASK_MODE
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
@@ -385,12 +471,27 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--vcd-alpha", type=float, default=0.5)
-    parser.add_argument("--vcd-beta", type=float, default=0.1)
+    parser.add_argument("--cd-alpha", "--vcd-alpha", dest="cd_alpha", type=float, default=0.6)
+    parser.add_argument("--cd-beta", "--vcd-beta", dest="cd_beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
+        "--negative-hidden-mode",
+        type=str,
+        choices=["mask_zero", "shuffle_tokens"],
+        default=NEGATIVE_HIDDEN_MODE,
+        help="How to construct negative hidden: mask tokens to zero or shuffle token positions.",
+    )
+    parser.add_argument(
+        "--top64-mask-mode",
+        action=argparse.BooleanOptionalAction,
+        default=TOP64_MASK_MODE,
+        help="Use top-64 probability candidate mask instead of beta-threshold mask.",
+    )
+    parser.add_argument(
+        "--cd-shadow-num-samples",
         "--vcd-shadow-num-samples",
+        dest="cd_shadow_num_samples",
         type=int,
         default=1,
         help="Number of Monte Carlo samples per reject position to estimate rescue probability.",
@@ -406,6 +507,11 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+
+    NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
+    TOP64_MASK_MODE = args.top64_mask_mode
+    print(f"Using negative hidden mode: [bold magenta]{args.negative_hidden_mode}[/bold magenta]")
+    print(f"Top64 mask mode: [bold cyan]{TOP64_MASK_MODE}[/bold cyan]")
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -482,13 +588,14 @@ def main() -> None:
                     block_size=bs,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
-                    vcd_alpha=args.vcd_alpha,
-                    beta=args.vcd_beta,
+                    cd_alpha=args.cd_alpha,
+                    beta=args.cd_beta,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
+                    negative_hidden_mode=args.negative_hidden_mode,
                     divergence_accumulator=divergence_accumulator if bs == block_size else None,
                     reject_records=reject_records if bs == block_size else None,
-                    vcd_shadow_num_samples=args.vcd_shadow_num_samples,
+                    cd_shadow_num_samples=args.cd_shadow_num_samples,
                     sample_idx=idx,
                     turn_idx=turn_index,
                     seed=sample_seed + bs,
@@ -526,6 +633,10 @@ def main() -> None:
 
     report_dir = _build_report_dir(args.dataset, args.report_dir)
     summary = _build_summary(reject_records, args, block_size)
+    summary_meta = summary.setdefault("meta", {})
+    summary_meta["negative_hidden_mode"] = args.negative_hidden_mode
+    summary_meta["top64_mask_mode"] = bool(TOP64_MASK_MODE)
+    summary_meta["final_override_keep"] = int(FINAL_OVERRIDE_KEEP)
 
     jsonl_path = report_dir / "reject_records.jsonl"
     csv_path = report_dir / "reject_records.csv"
@@ -548,15 +659,15 @@ def main() -> None:
     print(f"Reject events recorded: {summary.get('reject_events', 0)}")
     if summary.get("reject_events", 0) > 0:
         print(f"Positive hit rate @reject: {summary['positive_hit_rate'] * 100:.2f}%")
-        print(f"VCD hit rate @reject: {summary['vcd_hit_rate'] * 100:.2f}%")
-        print(f"Hit-rate gain (VCD - Positive): {summary['hit_rate_gain'] * 100:+.2f}%")
-        print(f"VCD shadow fix rate @reject: {summary['vcd_shadow_fix_rate'] * 100:.2f}%")
+        print(f"{COMPARE_NAME} hit rate @reject: {summary['vcd_hit_rate'] * 100:.2f}%")
+        print(f"Hit-rate gain ({COMPARE_NAME} - Positive): {summary['hit_rate_gain'] * 100:+.2f}%")
+        print(f"{COMPARE_NAME} shadow fix rate @reject: {summary['vcd_shadow_fix_rate'] * 100:.2f}%")
         print(
-            "Mean rescue-prob (Positive / VCD-shadow): "
+            f"Mean rescue-prob (Positive / {COMPARE_NAME}-shadow): "
             f"{summary['positive_rescue_prob_est']['mean']:.4f} / {summary['vcd_shadow_rescue_prob_est']['mean']:.4f}"
         )
         print(
-            "Mean rescue-prob gain (VCD - Positive): "
+            f"Mean rescue-prob gain ({COMPARE_NAME} - Positive): "
             f"{summary['rescue_prob_gain_vcd_minus_positive']['mean']:+.4f}"
         )
     print(f"Report directory: {report_dir}")

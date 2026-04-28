@@ -22,7 +22,7 @@ for task in "${TASKS[@]}"; do
   torchrun \
     --nproc_per_node=${NPROC_PER_NODE} \
     --master_port=${MASTER_PORT} \
-    -m alpha_adjusting.data_colecting \
+    -m analysis.tok_level_ana \
     --dataset "$DATASET_NAME" \
     --max-samples "$MAX_SAMPLES" \
     --model-name-or-path Qwen/Qwen3-4B \
