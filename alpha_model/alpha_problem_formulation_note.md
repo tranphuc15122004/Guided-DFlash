@@ -1,137 +1,87 @@
-# Alpha problem formulation note
+# **Mô hình hóa bài toán $M = (S , A , P , R , \gamma)$**
 
-## 1. Objective
+## Problem setup
 
-Train an alpha policy that adapts contrastive strength per decode block in DFlash to improve acceptance length while preserving generation quality.
+Trong mô hình diffusion speculative decoding Dflash, việc áp dụng cơ chế contrastive decoding đang bị giới hạn hiệu quả bởi việc lựa chọn hệ số alpha (pos - alpha * neg). Cố định một alpha cho toàn bộ kịch bản cho thấy việc không hiệu quả, cần có một cơ chế điều khiển hệ số alpha động cho cơ chế CD trong từng decode block. Ý tưởng hiện tại ta sẽ train một model RL nhằm điều chỉnh alpha theo output của mô hình drafter
 
-Main contrastive rule per token rank position j at diffusion position i:
+- block size = 16 → 15 token cần diffusion mỗi lần
 
-z_cd[i, j] = z_pos[i, j] - alpha[i, b(j)] * z_neg_on_draft[i, j]
+## State $S$
 
-- z_pos: draft logits on draft top-k tokens
-- z_neg_on_draft: negative logits gathered on the same draft token ids
-- b(j): rank-bucket mapping (3 buckets)
+Tập trạng thái của model , tại mỗi thời điểm drafter đưa ra kết quả sẽ là một lần alpha agent sẽ đưa ra quyết định.
 
-## 2. Environment and timeline
+- Positive sample (32 top rank token)
+    - log(logit)
+    - log(softmax(logit))
+    - softmax(logit)
+    - các thống kê (entropy , top1 margin, top-k mass ,. .. )
+- Negative sample
+    - log(logit)
+    - log(softmax(logit))
+    - softmax(logit)
+    - các thống kê (entropy, top1 margin, top-k mass , …)
+- Cross sample features
+    - hiệu của 2 sample (pos - neg)
+    - KL divergence
+- Position: (block position , vị trí tuyệt đối của từng token trong câu) (normalize)
+- alpha tại decode block trước đó $\alpha_{t-1}$
 
-- Block size B = 16
-- Decision positions per block: B-1 = 15
-- At each block t:
-  1) draft/negative logits are produced
-  2) alpha policy outputs alpha_t
-  3) contrastive logits are applied
-  4) target model verifies proposal and returns acceptance result
-  5) environment transitions to next block state
+## Action $A$
 
-Episode ends at EOS or max token limit.
+Một hành động của model là để xuất ra một hệ số alpha phù hợp tại mỗi thời điểm.
 
-## 3. MDP definition
+Tại môi token sẽ đưa ra 3 hệ số alpha. 
 
-M = (S, A, P, R, gamma)
+Phạm vi áp dụng của alpha sẽ là mỗi alpha sẽ được áp dụng cho 10 top token. Ví dụ top 10 token có rank cao nhất trong positive sample logit sẽ được áp dụng alpha [0], từ top 11 đến top 20 sẽ được áp dụng alpha [1] , …
 
-### State S_t
+$$
+a_t  \in \R^{(B-1) \times 3} : \text{cho mỗi bucket 10 top token}
+$$
 
-State contains block-local evidence needed to choose alpha:
+Tại sao phải sử dụng 3 hệ số alpha thay vì dùng từng alpha cho từng token ?
 
-- draft_topk_token_ids, draft_topk_logits: shape (15, K)
-- neg_logits_on_draft_topk_ids: shape (15, K)
-- block_position: shape (15,)
-- absolute_position: shape (15,)
-- optional alpha_prev: shape (15, 3)
+Việc sử dụng 3 token này sẽ làm loose hơn yêu cầu học của model, thay vì phải học cách tìm được vị trí của target token ở đầu trong dữ liệu đầu vào là phân phối của logit hệ thống (khá khó)
 
-Notes:
+## Reward $R$
 
-- Derived statistics (entropy, margins, KL, mass) are optional engineered features computed offline from raw logits.
-- Keep raw aligned logits as source of truth.
+Reward 1 sẽ giúp model học được việc đây rank lên, cũng như tránh model làm xấu đi rank của target
 
-### Action A_t
+$$
+r_1 = \sum_{i = 1}^{B-1} \Delta_{target\ rank} * \exp(- \frac{i-1 }{\gamma})
+$$
 
-alpha_t in R^(15 x 3), typically bounded to [alpha_min, alpha_max].
+Reward 2 sẽ thưởng thêm nếu model đẩy được target lên top1, phần thưởng này nên lớn hơn so với reward 1 để model tập trung đẩy target token lên top 1 để được fix được draft model thay vì chỉ đẩy lên một cách dàn trải như reward 1
 
-Interpretation:
+$$
+r_2 = \sum_{i =1}^{B-1} 2 \times \exp(- \frac{i-1}{\gamma}) \times \text{target rank len top 1}
+$$
 
-- 3 alpha values per diffusion position
-- each alpha controls one rank bucket (1..10, 11..20, 21..K)
+Reward 3 thì ưu tiên làm tăng acclength của model, mục tiêu chính của bài toán. Bằng cách định nghĩa này thì model sẽ phải học rằng model ưu tiên việc không làm tệ đi trước accpetance trung bình trước khi cải thiện nó.
 
-### Transition P
+$$
+r_3 = \max(\Delta  acc\_length , 0 ) - \lambda \max(-\Delta acc\_length , 0 ) 
+$$
 
-Given S_t and A_t:
+Hàm reward tổng hợp :
 
-- proposal distribution changes through contrastive logits
-- verifier decides accepted prefix length and reject fix token
-- committed tokens update context for next block
-- therefore S_(t+1) depends on both current state and action
+$$
+R = w_1r_1 + w_2r_2  +w_3r_3
+$$
 
-### Reward R_t
+Thử bắt đầu bằng $w_1  = 0.1 , w_2 = 0.1 , w_3 = 1.0 , \lambda = 3.0 , \beta = 0.02 , \gamma  =7$ 
 
-Composite design:
+## Episode
 
-- rank improvement reward (target rank moved up)
-- top-1 hit bonus
-- acceptance-length gain with asymmetric penalty for degradation
-- optional KL regularization to prevent excessive distribution drift
+một episode là một quá trình decode ra toàn bộ câu trả lời cho một câu hỏi 
 
-Total reward template:
+(s , a ,s a, ….)
 
-R_t = w1 *r1_t + w2* r2_t + w3 *r3_t - beta* KL_t
+Thu thập dữ liệu → train ngẫu nhiê
 
-Recommended initial weights:
+## Transition $P$
 
-- w1 = 0.1
-- w2 = 0.1
-- w3 = 1.0
-- lambda (downside penalty) = 3.0
-- beta = 0.02
+sau quá trình drafting của draft model, kết quả thu được là positive và negative sample có kích thước $R^{(B-1) \times dict \ size}$
 
-## 4. Why this is sequential (not pure independent bandit)
+mô hình alpha RL (nhẹ) sẽ được sử dụng để đưa ra một hệ số alpha adaptive cho cơ chế contrastive hiện tại 
 
-- Accepted/rejected tokens modify future context.
-- Future verifier behavior depends on current committed tokens.
-- Action at block t can improve or harm later blocks.
-
-Implication:
-
-- Contextual bandit is useful as a fast baseline.
-- Full RL (for example PPO style training) is better for long-horizon optimization.
-
-## 5. Practical training strategy
-
-Phase 1: data collection and offline feature construction
-
-- collect raw block records
-- compute engineered features and reward targets offline
-
-Phase 2: baseline policy
-
-- train contextual policy with block-local reward
-- validate acceptance and quality metrics
-
-Phase 3: sequential fine-tuning
-
-- move to RL objective over full episodes
-- keep KL or trust-region style stabilization
-
-## 6. Core assumptions to validate experimentally
-
-1) Improving per-block acceptance generally increases sentence-level acceptance.
-2) 3-bucket alpha parameterization is expressive enough for gains.
-3) KL regularization prevents quality collapse.
-4) Gains transfer across datasets/prompts and not only training distribution.
-
-## 7. Metrics to track
-
-Primary:
-
-- average acceptance length
-- decoding speedup versus baseline alpha
-
-Safety/quality:
-
-- degradation rate (blocks with acceptance drop)
-- KL drift statistics
-- answer quality task metric (if available)
-
-Stability:
-
-- variance of rewards across seeds
-- policy entropy or alpha distribution coverage
+Target model sẽ verify logit đầu ra của cơ chế contrastive , trả về acceptance length và fixed token tại vị trí reject

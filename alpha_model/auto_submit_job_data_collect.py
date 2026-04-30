@@ -196,6 +196,12 @@ def main() -> int:
 	args = _parse_args()
 	start_step = args.start_step or args.instance_per_job
 
+	# Thay đổi trong _build_env()
+	if args.project is not None:
+		env["PROJECT"] = args.project
+	else:
+		env.pop("PROJECT", None)  # ← Xóa PROJECT nếu có
+
 	current_start = args.start_index
 	for dataset in args.datasets:
 		num_jobs = _ceil_div(args.num_instances, args.instance_per_job)

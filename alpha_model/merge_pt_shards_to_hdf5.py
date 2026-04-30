@@ -27,8 +27,7 @@ REQUIRED_FIELDS = [
     "acceptance_length",
 ]
 
-OPTIONAL_FIELDS = ["alpha_prev"]
-
+OPTIONAL_FIELDS = ["alpha_prev", "alpha_applied"]
 
 """
 python alpha_model/merge_pt_shards_to_hdf5.py \
