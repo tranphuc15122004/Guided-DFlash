@@ -519,6 +519,32 @@ def load_and_process_dataset_ALPHA(
     return dataset
 
 
+def load_online_train_dataset():
+    """
+    This function loads the training dataset for online training. 
+    Dataset:
+        - gsm8k (math): 7,473                   -> 7,473
+        - metamath (math): 395,000              -> 20.000
+        - math_instruct (math): 262,039         -> 5.000
+        - magicoder (code): 111,183             -> 20.000
+
+        In total: 52,473
+    """
+    
+    datasets = []
+    datasets.append(load_and_process_dataset_ALPHA("gsm8k", split="train"))
+    datasets.append(load_and_process_dataset_ALPHA("metamath", split="train", num_instances=20000))
+    datasets.append(load_and_process_dataset_ALPHA("math_instruct", split="train", num_instances=5000))
+    datasets.append(load_and_process_dataset_ALPHA("magicoder", split="train", num_instances=20000))
+
+    combined = datasets[0]
+    for ds in datasets[1:]:
+        combined = combined.concatenate(ds)
+
+    print(f"✅ Combined online training dataset size: {len(combined):,} samples.")
+    return combined
+
+
 if __name__ == "__main__":
     # Streaming inspection smoke test
     streaming_test_cases = ["math_instruct", "metamath", "magicoder"]

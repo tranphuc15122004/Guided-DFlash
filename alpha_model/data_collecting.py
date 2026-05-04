@@ -39,6 +39,32 @@ Dataset:
 In total: 52,473
 """
 
+'''
+- **sample_id**: int — id của sample (từ iterator / args.seed + idx).
+- **turn_index**: int — thứ tự turn trong cuộc hội thoại.
+- **block_index**: int — chỉ số block hiện tại trong quá trình decode.
+- **draft_topk_token_ids**: int32 tensor, shape (S-1, K) — các token id top‑K do draft (positive) xếp hạng cao nhất cho mỗi vị trí diffusion trong block (lưu batch dim đã bị squeeze(0) vì generation chạy batch=1).
+    - Source: torch.topk(positive_draft_logits, k=collector_topk).indices.
+    - Gắn với cùng thứ tự vị trí như các trường logits/positions bên dưới.
+- **draft_topk_logits**: float32 tensor, shape (S-1, K) — logits tương ứng với draft_topk_token_ids từ positive draft distribution.
+    - Source: topk.values từ positive draft logits.
+- **neg_logits_on_draft_topk_ids**: float32 tensor, shape (S-1, K) — logits của negative draft lấy trên chính các token id trong draft_topk_token_ids (để so sánh pos vs neg trên cùng token set).
+    - Tạo bằng torch.gather(negative_logits, dim=-1, index=draft_topk_token_ids).
+- **block_position**: float32 tensor, shape (S-1,) — vị trí nội bộ trong block, normalized (0..1).
+    - Tạo bằng torch.arange(block_size-1) / (block_size-2) (denom tối thiểu 1).
+- **absolute_position**: float32 tensor, shape (S-1,) — vị trí tuyệt đối trong sequence, normalized (0..1).
+    - Tạo bằng block_position_ids[:,1:] / (max_length-1).
+- **target_token_id**: int32 tensor, shape (S-1,) — token ids do target model sinh (posterior[:, :-1]) tương ứng với các vị trí diffusion (dùng để so sánh/verify với draft).
+    - Lưu dạng CPU, đã squeeze(0).
+- **acceptance_length**: int — số token được chấp nhận ở block này (giá trị lưu là int(acceptance_length + 1) theo code).
+    - Cách tính:acceptance_length_var = (block_output_ids[:,1:] == posterior[:,:-1]).cumprod(dim=1).sum(dim=1)[0].item()stored = acceptance_length_var + 1
+    - Ý nghĩa: số token liên tiếp đầu tiên trong block được target chấp nhận (tức block_output_ids[:, :stored] là các token accepted). Giá trị ∈ [1, block_size].
+- **alpha_prev**: float32 tensor, shape (S-1, 3) — alpha từ block trước (per-position, 3 buckets), nếu có; lưu dạng CPU.
+    - Trong code khởi tạo alpha_prev có kích thước `(1, max(block_size-1,1), 3)` và trước khi lưu dùng .squeeze(0).
+- **alpha_applied**: float32 tensor, shape (S-1, 3) — alpha đã được áp dụng cho block hiện tại (per-position, 3 buckets), lưu CPU.
+'''
+
+
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
 TOP64_MASK_MODE = False 
