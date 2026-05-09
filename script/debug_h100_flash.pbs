@@ -4,13 +4,13 @@
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=24GB
-#PBS -l walltime=00:20:00
+#PBS -l walltime=00:45:00
 #PBS -l storage=scratch/jp09+gdata/hn98
 #PBS -j oe
+#PBS -V
 
 set -euo pipefail
 
-# Allow running either under PBS (qsub) or directly from shell for quick debug.
 if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
   cd "$PBS_O_WORKDIR"
 else
@@ -39,14 +39,14 @@ import flash_attn
 print('flash_attn', flash_attn.__version__)
 PY
 
-if ! command -v torchrun >/dev/null 2>&1; then
-  echo "ERROR: torchrun not found in /scratch/jp09/dd9648/venvs/dflash_h100."
-  exit 1
+export SCHEME=${SCHEME:-CD_alpha_model}
+export MAX_SAMPLES=${MAX_SAMPLES:-128}
+
+# If ALPHA_MODEL_PATH is set, pass it via EXTRA_BENCHMARK_ARGS
+if [[ -n "${ALPHA_MODEL_PATH:-}" ]]; then
+  export EXTRA_BENCHMARK_ARGS="${EXTRA_BENCHMARK_ARGS:-} --alpha-model-path $ALPHA_MODEL_PATH"
+  echo "Using alpha model: $ALPHA_MODEL_PATH"
+else
+  echo "No alpha model set. Using fixed cd-alpha=0.6 (baseline)"
 fi
-
-export NPROC_PER_NODE=1
-export MASTER_PORT=29617
-export EXTRA_BENCHMARK_ARGS="--no-deterministic"
-export TASKS_OVERRIDE="gsm8k:128"
-
-bash ./run_benchmark.sh
+exec bash run_benchmark.sh

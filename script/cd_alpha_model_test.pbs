@@ -1,0 +1,77 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=24GB
+#PBS -l walltime=00:20:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+#PBS -V
+
+set -euo pipefail
+
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+  cd "$PBS_O_WORKDIR"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+mkdir -p logs
+
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CUDA_LAUNCH_BLOCKING=0
+
+SCHEME="cd_alpha_model"
+DATASET="gsm8k"
+MAX_SAMPLES=32
+MAX_NEW_TOKENS=2048
+TEMPERATURE=0.0
+CD_ALPHA=0.6
+CD_BETA=0.0
+NEG_DROPOUT=0.3
+NEG_HIDDEN_MODE="mask_zero"
+ALPHA_MODEL_PATH="${ALPHA_MODEL_PATH:-}"
+ALPHA_TOP_K=32
+
+ALPHA_MODEL_ARG=""
+if [[ -n "$ALPHA_MODEL_PATH" ]]; then
+  ALPHA_MODEL_ARG="--alpha-model-path $ALPHA_MODEL_PATH"
+  JOB_TAG="cd_alpha_model_walpha_${PBS_JOBID:-local_$(date +%Y%m%d_%H%M%S)}"
+else
+  JOB_TAG="cd_alpha_model_baseline_${PBS_JOBID:-local_$(date +%Y%m%d_%H%M%S)}"
+fi
+
+LOG_FILE="logs/cd_alpha_model_${JOB_TAG}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "========================================================"
+echo "SCHEME    : $SCHEME"
+echo "DATASET   : $DATASET"
+echo "SAMPLES   : $MAX_SAMPLES"
+echo "ALPHA MODEL: $ALPHA_MODEL_PATH"
+echo "CD_ALPHA  : $CD_ALPHA"
+echo "CD_BETA   : $CD_BETA"
+echo "NEG_DROPOUT: $NEG_DROPOUT"
+echo "NEG_HIDDEN_MODE: $NEG_HIDDEN_MODE"
+echo "========================================================"
+
+python -m scheme.CD_alpha_model \
+  --model-name-or-path Qwen/Qwen3-4B \
+  --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
+  --dataset "$DATASET" \
+  --max-samples "$MAX_SAMPLES" \
+  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --temperature "$TEMPERATURE" \
+  --cd-alpha "$CD_ALPHA" \
+  --cd-beta "$CD_BETA" \
+  --negative-context-dropout "$NEG_DROPOUT" \
+  --negative-hidden-mode "$NEG_HIDDEN_MODE" \
+  --alpha-top-k "$ALPHA_TOP_K" \
+  ${ALPHA_MODEL_ARG} \
+  --deterministic \
+  --seed 42

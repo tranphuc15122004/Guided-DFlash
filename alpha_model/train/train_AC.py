@@ -6,6 +6,7 @@ Có gradient clipping, entropy coef configurable.
 """
 
 import argparse
+import csv
 import os
 import sys
 import torch
@@ -22,6 +23,7 @@ try:
         compute_reward_components_vectorized,
         total_reward,
         compute_bucket_thresholds,
+        simulate_acceptance_length_vectorized,
     )
     from .offline_dataset_h5 import HDF5BanditDataset, collate_bandit_batch
 except (ImportError, ValueError):
@@ -32,6 +34,7 @@ except (ImportError, ValueError):
         compute_reward_components_vectorized,
         total_reward,
         compute_bucket_thresholds,
+        simulate_acceptance_length_vectorized,
     )
     from alpha_model.train.offline_dataset_h5 import HDF5BanditDataset, collate_bandit_batch
 
@@ -53,10 +56,17 @@ class GaussianPolicy(ContextualBanditAlpha):
 def train_one_epoch(dataloader, actor, critic, opt_actor, opt_critic, args, device):
     actor.train()
     critic.train()
-    total_actor_loss = 0.0
-    total_critic_loss = 0.0
-    total_rew = 0.0
-    batches = 0
+
+    # Thu thập metrics từ tất cả batches để tính statistics cuối epoch
+    hist_actor_loss = []
+    hist_critic_loss = []
+    hist_reward = []
+    hist_r1 = []
+    hist_r2 = []
+    hist_r3 = []
+    hist_entropy = []
+    hist_baseline_acc = []
+    hist_model_acc = []
 
     bucket_thresholds = compute_bucket_thresholds(args.top_k, args.num_buckets)
 
@@ -79,7 +89,7 @@ def train_one_epoch(dataloader, actor, critic, opt_actor, opt_critic, args, devi
         action = torch.clamp(action, -args.max_alpha, args.max_alpha)
 
         # ── Tính reward toàn batch ──
-        r1, r2, r3 = compute_reward_components_vectorized(
+        r1, r2, r3, model_acc_len = compute_reward_components_vectorized(
             pos, neg, topk_ids, tgt, action, baseline,
             topk=args.top_k, bucket_thresholds=bucket_thresholds,
             gamma=args.gamma_decay, lambda_=args.lambda_r3,
@@ -111,12 +121,37 @@ def train_one_epoch(dataloader, actor, critic, opt_actor, opt_critic, args, devi
         torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
         opt_critic.step()
 
-        total_actor_loss += actor_loss.item()
-        total_critic_loss += critic_loss.item()
-        total_rew += reward.mean().item()
-        batches += 1
+        # Lưu metrics để cuối epoch tính statistics
+        hist_actor_loss.append(actor_loss.item())
+        hist_critic_loss.append(critic_loss.item())
+        hist_reward.append(reward.mean().item())
+        hist_r1.append(r1.mean().item())
+        hist_r2.append(r2.mean().item())
+        hist_r3.append(r3.mean().item())
+        hist_entropy.append(entropy.item())
+        hist_baseline_acc.append(baseline.mean().item())
+        hist_model_acc.append(model_acc_len.float().mean().item())
 
-    return total_actor_loss / batches, total_critic_loss / batches, total_rew / batches
+    # ── Tính statistics cuối epoch ──
+    def stats(values):
+        t = torch.tensor(values)
+        return t.mean().item(), t.std().item(), t.min().item(), t.max().item()
+
+    def fmt_stats(name, values):
+        m, s, lo, hi = stats(values)
+        return f"{name}: {m:.4f}±{s:.4f} [{lo:.4f}, {hi:.4f}]"
+
+    print(f"  {fmt_stats('actor_loss', hist_actor_loss)}")
+    print(f"  {fmt_stats('critic_loss', hist_critic_loss)}")
+    print(f"  {fmt_stats('reward', hist_reward)}")
+    print(f"  {fmt_stats('r1', hist_r1)}")
+    print(f"  {fmt_stats('r2', hist_r2)}")
+    print(f"  {fmt_stats('r3', hist_r3)}")
+    print(f"  {fmt_stats('entropy', hist_entropy)}")
+    print(f"  {fmt_stats('baseline_acc', hist_baseline_acc)}")
+    print(f"  {fmt_stats('model_acc', hist_model_acc)}")
+
+    return hist_actor_loss, hist_critic_loss, hist_reward, hist_r1, hist_r2, hist_r3, hist_entropy, hist_baseline_acc, hist_model_acc
 
 
 # -------------------- CLI --------------------
@@ -124,6 +159,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train alpha RL agent for DFlash")
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="checkpoints")
+    parser.add_argument("--max-records", type=int, default=0,
+                        help="limit to N records for debugging (0 = use all)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -138,7 +175,7 @@ def parse_args():
     parser.add_argument("--w3", type=float, default=1.0, help="weight for r3 (acceptance length)")
     parser.add_argument("--entropy-coef", type=float, default=0.01, help="entropy bonus coefficient")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="gradient clipping")
-    parser.add_argument("--save-interval", type=int, default=1)
+    parser.add_argument("--save-interval", type=int, default=5, help="Epoch interval to save periodic checkpoints")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
@@ -149,6 +186,17 @@ def main():
     print(f"[train_AC] device: {device}")
 
     dataset = HDF5BanditDataset(args.data_path)
+
+    if args.max_records > 0:
+        original_len = len(dataset)
+        dataset.num_records = min(args.max_records, original_len)
+        print(f"Limited to {dataset.num_records} / {original_len} records")
+        # Also cap the underlying h5 references via slicing in __getitem__
+        class SubsetHDF5BanditDataset(HDF5BanditDataset):
+            def __len__(self):
+                return dataset.num_records
+        dataset.__class__ = SubsetHDF5BanditDataset
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -169,14 +217,86 @@ def main():
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
-        a_loss, c_loss, r = train_one_epoch(dataloader, actor, critic, opt_actor, opt_critic, args, device)
-        print(f"Epoch {epoch:3d} | actor_loss={a_loss:.4f}  critic_loss={c_loss:.4f}  avg_reward={r:.4f}")
+    best_reward = -float("inf")
+    
+    # Mở file CSV để ghi log
+    csv_path = out / "training_history.csv"
+    csv_file = open(csv_path, mode="w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "epoch", 
+        "actor_loss_mean", "actor_loss_std", 
+        "critic_loss_mean", "critic_loss_std", 
+        "reward_mean", "reward_std", 
+        "r1_mean", "r1_std", 
+        "r2_mean", "r2_std", 
+        "r3_mean", "r3_std", 
+        "entropy_mean", "entropy_std",
+        "baseline_acc_mean", "baseline_acc_std",
+        "model_acc_mean", "model_acc_std"
+    ])
 
+    for epoch in range(1, args.epochs + 1):
+        print(f"─── Epoch {epoch}/{args.epochs} ───")
+        hist = train_one_epoch(dataloader, actor, critic, opt_actor, opt_critic, args, device)
+
+        # Tổng hợp epoch: mean và std của tất cả batches
+        def stats(vals):
+            if not vals:
+                return 0.0, 0.0
+            t = torch.tensor(vals)
+            return t.mean().item(), t.std().item()
+            
+        act_mean, act_std = stats(hist[0])
+        crit_mean, crit_std = stats(hist[1])
+        rew_mean, rew_std = stats(hist[2])
+        r1_mean, r1_std = stats(hist[3])
+        r2_mean, r2_std = stats(hist[4])
+        r3_mean, r3_std = stats(hist[5])
+        ent_mean, ent_std = stats(hist[6] if len(hist) > 6 else []) # Compatibility for entropy
+        base_acc_mean, base_acc_std = stats(hist[7] if len(hist) > 7 else [])
+        mod_acc_mean, mod_acc_std = stats(hist[8] if len(hist) > 8 else [])
+
+        print(f"✔ Epoch {epoch:3d} | "
+              f"actor_loss={act_mean:.4f}  "
+              f"critic_loss={crit_mean:.4f}  "
+              f"reward={rew_mean:.4f}  "
+              f"r1={r1_mean:.4f}  "
+              f"r2={r2_mean:.4f}  "
+              f"r3={r3_mean:.4f}")
+        print(f"            | "
+              f"baseline_acc={base_acc_mean:.4f}  "
+              f"model_acc={mod_acc_mean:.4f}")
+        print()
+        
+        # Ghi vào CSV
+        csv_writer.writerow([
+            epoch, 
+            act_mean, act_std, 
+            crit_mean, crit_std, 
+            rew_mean, rew_std, 
+            r1_mean, r1_std, 
+            r2_mean, r2_std, 
+            r3_mean, r3_std, 
+            ent_mean, ent_std,
+            base_acc_mean, base_acc_std,
+            mod_acc_mean, mod_acc_std
+        ])
+        csv_file.flush()
+
+        # Lưu best checkpoint dựa trên reward
+        if rew_mean > best_reward:
+            best_reward = rew_mean
+            torch.save(actor.state_dict(), out / "actor_best.pt")
+            torch.save(critic.state_dict(), out / "critic_best.pt")
+            print(f"  [+] New best reward: {best_reward:.4f} - Saved best checkpoint.\n")
+
+        # Lưu checkpoint định kỳ
         if epoch % args.save_interval == 0:
             torch.save(actor.state_dict(), out / f"actor_epoch{epoch}.pt")
             torch.save(critic.state_dict(), out / f"critic_epoch{epoch}.pt")
 
+    csv_file.close()
     print("Training completed!")
 
 

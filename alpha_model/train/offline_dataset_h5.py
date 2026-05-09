@@ -8,54 +8,56 @@ class HDF5BanditDataset(Dataset):
     def __init__(self, h5_path: str, device: str = "cpu"):
         self.h5_path = Path(h5_path)
         self.device = device
+
+        # Mở HDF5 và load toàn bộ dữ liệu vào RAM ngay lập tức.
+        # HDF5 hiện tại có chunking cực kỳ tệ cho random access
+        # (ví dụ chunks=(63622,1,1) → 1 record cần 480 chunk reads),
+        # nên đọc từ HDF5 mỗi lần __getitem__ là cực chậm (~1000s/batch).
         self.h5 = h5py.File(self.h5_path, 'r')
         self.num_records = self.h5.attrs['num_records']
-        # Lấy thông tin shape
-        self.layout = {}
-        for name in self.h5.keys():
-            ds = self.h5[name]
-            self.layout[name] = {"shape": ds.shape[1:], "dtype": ds.dtype}
-        # Kiểm tra các field bắt buộc cho training
+
+        # Các field cần cho training
         self.required_fields = [
             "draft_topk_logits", "neg_logits_on_draft_topk_ids",
             "draft_topk_token_ids", "target_token_id",
             "block_position", "absolute_position", "alpha_prev",
             "acceptance_length"
         ]
-        missing = [f for f in self.required_fields if f not in self.layout]
+        missing = [f for f in self.required_fields if f not in self.h5]
         if missing:
             raise ValueError(f"Missing fields in HDF5: {missing}")
-        self.S = self.layout["draft_topk_logits"]["shape"][0]  # = block_size-1
-        self.K = self.layout["draft_topk_logits"]["shape"][1]  # = top_k
-        self.num_buckets = self.layout["alpha_prev"]["shape"][1]  # = 3
-        print(f"Loaded {self.num_records} records, S={self.S}, K={self.K}")
+
+        # Đọc toàn bộ dữ liệu vào RAM — ~23GB, nằm trong 48GB budget
+        print(f"Loading {self.num_records} records into memory...")
+        self.pos_logits = torch.from_numpy(self.h5["draft_topk_logits"][:]).float()
+        self.neg_logits = torch.from_numpy(self.h5["neg_logits_on_draft_topk_ids"][:]).float()
+        self.topk_token_ids = torch.from_numpy(self.h5["draft_topk_token_ids"][:]).long()
+        self.target_token_id = torch.from_numpy(self.h5["target_token_id"][:]).long()
+        self.block_pos = torch.from_numpy(self.h5["block_position"][:]).float()
+        self.abs_pos = torch.from_numpy(self.h5["absolute_position"][:]).float()
+        self.alpha_prev = torch.from_numpy(self.h5["alpha_prev"][:]).float()
+        self.baseline_acc_len = torch.from_numpy(self.h5["acceptance_length"][:]).float()
+        self.h5.close()  # Đóng file HDF5 — không cần nữa
+
+        self.S = self.pos_logits.shape[1]  # = block_size-1
+        self.K = self.pos_logits.shape[2]  # = top_k
+        self.num_buckets = self.alpha_prev.shape[2]  # = 3
+        print(f"Loaded {self.num_records} records, S={self.S}, K={self.K}, memory=~23GB")
 
     def __len__(self):
         return self.num_records
 
     def __getitem__(self, idx):
-        # Đọc từ HDF5 – mỗi field là mảng (record_index, ...)
-        pos_logits = torch.tensor(self.h5["draft_topk_logits"][idx], dtype=torch.float32)
-        neg_logits = torch.tensor(self.h5["neg_logits_on_draft_topk_ids"][idx], dtype=torch.float32)
-        topk_token_ids = torch.tensor(self.h5["draft_topk_token_ids"][idx], dtype=torch.long)
-        target_token_ids = torch.tensor(self.h5["target_token_id"][idx], dtype=torch.long)
-        block_pos = torch.tensor(self.h5["block_position"][idx], dtype=torch.float32)
-        abs_pos = torch.tensor(self.h5["absolute_position"][idx], dtype=torch.float32)
-        alpha_prev = torch.tensor(self.h5["alpha_prev"][idx], dtype=torch.float32)
-        baseline_acc_len = int(self.h5["acceptance_length"][idx])
         return {
-            "pos_logits": pos_logits,
-            "neg_logits": neg_logits,
-            "topk_token_ids": topk_token_ids,
-            "target_token_ids": target_token_ids,
-            "block_pos": block_pos,
-            "abs_pos": abs_pos,
-            "alpha_prev": alpha_prev,
-            "baseline_acc_len": baseline_acc_len,
+            "pos_logits": self.pos_logits[idx],
+            "neg_logits": self.neg_logits[idx],
+            "topk_token_ids": self.topk_token_ids[idx],
+            "target_token_ids": self.target_token_id[idx],
+            "block_pos": self.block_pos[idx],
+            "abs_pos": self.abs_pos[idx],
+            "alpha_prev": self.alpha_prev[idx],
+            "baseline_acc_len": self.baseline_acc_len[idx].item(),
         }
-
-    def close(self):
-        self.h5.close()
 
 def collate_bandit_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Gộp batch từ các dict."""

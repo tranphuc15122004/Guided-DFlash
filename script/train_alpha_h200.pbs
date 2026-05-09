@@ -1,0 +1,108 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=48GB
+#PBS -l walltime=06:00:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+mkdir -p logs
+
+LOG_FILE="logs/train_alpha_${PBS_JOBID}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ── Activate venv ──
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
+mkdir -p "$HF_HOME"
+
+echo "=== Environment ==="
+echo "Job ID: $PBS_JOBID"
+echo "Node: $(hostname)"
+python -c "import torch; print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}')"
+python -c "import h5py; print('h5py', h5py.__version__)"
+echo ""
+
+# ── Configuration (override via env vars) ──
+H5_PATH="${H5_PATH:-alpha_model/alpha_dataset_001.h5}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/alpha_trained_${PBS_JOBID}}"
+BATCH_SIZE="${BATCH_SIZE:-1024}"
+EPOCHS="${EPOCHS:-100}"
+LR="${LR:-1e-4}"
+TOP_K="${TOP_K:-32}"
+HIDDEN_DIM="${HIDDEN_DIM:-128}"
+NUM_BUCKETS="${NUM_BUCKETS:-3}"
+MAX_ALPHA="${MAX_ALPHA:-2.0}"
+GAMMA_DECAY="${GAMMA_DECAY:-7.0}"
+LAMBDA_R3="${LAMBDA_R3:-3.0}"
+W1="${W1:-0.1}"
+W2="${W2:-0.1}"
+W3="${W3:-1.0}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.01}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+
+# ── Debug mode: use subset if DEBUG=1 ──
+# Usage: qsub -v DEBUG=1 script/train_alpha_h200.pbs
+if [[ "${DEBUG:-0}" = "1" ]]; then
+  echo "=== DEBUG MODE: Using subset of data ==="
+  EPOCHS=2
+  BATCH_SIZE=64
+  MAX_RECORDS=1000
+else
+  MAX_RECORDS=0
+fi
+
+echo "=== Training Configuration ==="
+echo "H5_PATH: $H5_PATH"
+echo "OUTPUT_DIR: $OUTPUT_DIR"
+echo "BATCH_SIZE: $BATCH_SIZE"
+echo "EPOCHS: $EPOCHS"
+echo "LR: $LR"
+echo "TOP_K: $TOP_K"
+echo "HIDDEN_DIM: $HIDDEN_DIM"
+echo "NUM_BUCKETS: $NUM_BUCKETS"
+echo "MAX_ALPHA: $MAX_ALPHA"
+echo "GAMMA_DECAY: $GAMMA_DECAY"
+echo "LAMBDA_R3: $LAMBDA_R3"
+echo "W1=$W1 W2=$W2 W3=$W3"
+echo "ENTROPY_COEF: $ENTROPY_COEF"
+echo "MAX_GRAD_NORM: $MAX_GRAD_NORM"
+echo "SAVE_INTERVAL: $SAVE_INTERVAL"
+echo "MAX_RECORDS: $MAX_RECORDS"
+echo ""
+
+# ── Train ──
+echo "=== Starting training ==="
+time python -m alpha_model.train.train_AC \
+  --data-path "$H5_PATH" \
+  --output-dir "$OUTPUT_DIR" \
+  --max-records "$MAX_RECORDS" \
+  --batch-size "$BATCH_SIZE" \
+  --epochs "$EPOCHS" \
+  --lr "$LR" \
+  --top-k "$TOP_K" \
+  --hidden-dim "$HIDDEN_DIM" \
+  --num-buckets "$NUM_BUCKETS" \
+  --max-alpha "$MAX_ALPHA" \
+  --gamma-decay "$GAMMA_DECAY" \
+  --lambda-r3 "$LAMBDA_R3" \
+  --w1 "$W1" \
+  --w2 "$W2" \
+  --w3 "$W3" \
+  --entropy-coef "$ENTROPY_COEF" \
+  --max-grad-norm "$MAX_GRAD_NORM" \
+  --save-interval "$SAVE_INTERVAL" \
+  --device cuda
+
+echo ""
+echo "=== Training completed at $(date) ==="
+echo "Output directory: $OUTPUT_DIR"
+ls -lh "$OUTPUT_DIR"/ 2>/dev/null || echo "(output dir may be empty or not exist)"

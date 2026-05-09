@@ -154,9 +154,9 @@ def compute_reward_components_batch(
     r3 = torch.max(delta, torch.zeros_like(delta)) - lambda_ * torch.max(-delta, torch.zeros_like(delta))
 
     if single_sample:
-        return r1.squeeze(0), r2.squeeze(0), r3.squeeze(0)
+        return r1.squeeze(0), r2.squeeze(0), r3.squeeze(0), acc_len_contrastive.squeeze(0)
 
-    return r1, r2, r3
+    return r1, r2, r3, acc_len_contrastive
 
 def total_reward_batch(r1: torch.Tensor, r2: torch.Tensor, r3: torch.Tensor,
                        w1=0.1, w2=0.1, w3=1.0) -> torch.Tensor:

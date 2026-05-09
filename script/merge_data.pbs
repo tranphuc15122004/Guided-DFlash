@@ -1,11 +1,10 @@
 #!/bin/bash
 #PBS -P hn98
-#PBS -q gpuhopper
-#PBS -l ngpus=1
-#PBS -l ncpus=12
-#PBS -l mem=48GB
-#PBS -l walltime=01:30:00
-#PBS -l storage=scratch/jp09+gdata/jp09
+#PBS -q normalbw
+#PBS -l ncpus=24
+#PBS -l mem=96GB
+#PBS -l walltime=06:00:00
+#PBS -l storage=scratch/jp09+gdata/hn98
 #PBS -j oe
 
 
@@ -27,23 +26,38 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "[$(date)] Starting merge job"
 echo "Working dir: $PWD"
 
-# Reuse a prebuilt environment; do not pip-install at job runtime.
-source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
-unset PYTHONPATH
+# Activate virtual environment (same as other PBS scripts in this project)
+VENV_PATH="${VENV_PATH:-/scratch/jp09/dd9648/venvs/dflash_h100}"
+if [[ -f "$VENV_PATH/bin/activate" ]]; then
+  echo "[INFO] Activating virtual environment: $VENV_PATH"
+  source "$VENV_PATH/bin/activate"
+else
+  echo "[ERROR] Virtual environment not found at $VENV_PATH"
+  exit 1
+fi
+
 export PYTHONFAULTHANDLER=1
 
-python3 - <<'PY'
-import sys
-import torch
-import h5py
-print('python', sys.executable)
-print('torch', torch.__version__)
-print('h5py', h5py.__version__)
-PY
+# ── Sanity check: verify the Python interpreter resolves numpy ──────────
+PYTHON_BIN="$(command -v python3)"
+echo "[INFO] Python interpreter: $PYTHON_BIN"
+echo "[INFO] Python version: $("$PYTHON_BIN" --version 2>&1)"
+
+if ! "$PYTHON_BIN" -c "import numpy" 2>/dev/null; then
+  echo "[ERROR] numpy is not importable with $PYTHON_BIN"
+  echo "[ERROR] VIRTUAL_ENV=${VIRTUAL_ENV:-NOT_SET}"
+  echo "[ERROR] sys.path follows:"
+  "$PYTHON_BIN" -c "import sys; print('\n'.join(sys.path))"
+  echo ""
+  echo "[HINT] Check that 'gdata/hn98' is included in the PBS -l storage directive."
+  echo "[HINT] The venv's python3 is a symlink to /g/data/hn98/mini3/bin/python3."
+  exit 3
+fi
+echo "[INFO] numpy OK: $("$PYTHON_BIN" -c "import numpy; print(numpy.__version__)")"
 
 INPUT_DIR="${INPUT_DIR:-alpha_model/collected_alpha_records}"
-OUTPUT_FILE="${OUTPUT_FILE:-alpha_model/alpha_dataset_002.h5}"
-COMPRESSION="${COMPRESSION:-gzip}"
+OUTPUT_FILE="${OUTPUT_FILE:-alpha_model/alpha_dataset_001.h5}"
+COMPRESSION="${COMPRESSION:-lzf}"
 
 if [[ ! -d "$INPUT_DIR" ]]; then
   echo "ERROR: input directory does not exist: $INPUT_DIR"
@@ -54,7 +68,7 @@ echo "INPUT_DIR=$INPUT_DIR"
 echo "OUTPUT_FILE=$OUTPUT_FILE"
 echo "COMPRESSION=$COMPRESSION"
 
-python3 alpha_model/merge_pt_shards_to_hdf5.py \
+"$PYTHON_BIN" alpha_model/merge_pt_shards_to_hdf5.py \
   --input-dir "$INPUT_DIR" \
   --output-file "$OUTPUT_FILE" \
   --compression "$COMPRESSION"

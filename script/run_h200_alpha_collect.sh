@@ -15,7 +15,7 @@ fi
 cd "$ROOT_DIR"
 mkdir -p logs
 
-PROJECT="${PROJECT:-jp09}"
+PROJECT="${PROJECT:-hn98}"
 QUEUE="${QUEUE:-gpuhopper}"
 NGPUS="${NGPUS:-1}"
 NCPUS="${NCPUS:-12}"

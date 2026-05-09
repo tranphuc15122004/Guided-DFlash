@@ -91,88 +91,90 @@ def _validate_record(record: Dict[str, Any], shard_hint: str = "") -> None:
         raise ValueError(f"Missing required fields {missing} in {shard_hint}")
 
 
-def _infer_layout(first_record: Dict[str, Any], all_records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    layout: Dict[str, Dict[str, Any]] = {}
-    optional_field_examples: Dict[str, Any] = {}
-
-    for key in REQUIRED_FIELDS:
-        arr = _to_numpy(first_record[key])
-        if key in SCALAR_FIELDS:
-            layout[key] = {"shape": (), "dtype": np.int32}
-        elif key in INT_FIELDS:
-            layout[key] = {"shape": arr.shape, "dtype": np.int32}
-        else:
-            layout[key] = {"shape": arr.shape, "dtype": np.float32}
-
-    for key in OPTIONAL_FIELDS:
-        if key in first_record:
-            optional_field_examples[key] = first_record[key]
-        else:
-            for record in all_records[1:]:
-                if key in record:
-                    optional_field_examples[key] = record[key]
-                    break
-
-        if key in optional_field_examples:
-            arr = _to_numpy(optional_field_examples[key])
-            layout[key] = {"shape": arr.shape, "dtype": np.float32}
-
-    return layout
-
-
-def _scan_records_for_layout(
+def _infer_shapes_from_all_records(
     shard_paths: Iterable[Path],
     logger: logging.Logger,
-) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]], int]:
-    logger.info("Scanning shards for layout inference...")
-    first_record: Optional[Dict[str, Any]] = None
-    optional_field_examples: Dict[str, Any] = {}
+) -> tuple[Dict[str, Dict[str, Any]], int]:
+    """
+    Scan ALL records across all shards to determine the canonical shape and dtype
+    for each field. This is more robust than inferring from the first record alone.
+    """
+    logger.info("Scanning all records for shape inference...")
+
+    # field_shapes[key] = set of shape tuples seen across records
+    field_shapes: Dict[str, set] = {}
     record_count = 0
 
     for record in tqdm(_iter_records(shard_paths, show_progress=True), desc="Scanning records"):
-        if first_record is None:
-            first_record = record
-        for key in OPTIONAL_FIELDS:
-            if key not in optional_field_examples and key in record:
-                optional_field_examples[key] = record[key]
+        for key, value in record.items():
+            arr = _to_numpy(value)
+            shape_tuple = tuple(arr.shape)
+            if key not in field_shapes:
+                field_shapes[key] = set()
+            field_shapes[key].add(shape_tuple)
         record_count += 1
 
-    if first_record is None:
+    if record_count == 0:
         raise ValueError("No records found in shards")
 
     logger.info(f"Found {record_count} records across shards")
-    layout = _infer_layout(first_record, [first_record])
-    for key, value in optional_field_examples.items():
-        layout[key] = {"shape": _to_numpy(value).shape, "dtype": np.float32}
+
+    # Build layout from observed shapes
+    layout: Dict[str, Dict[str, Any]] = {}
+    all_expected_keys = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
+
+    for key in all_expected_keys:
+        if key not in field_shapes:
+            # Optional field not present in any record → skip
+            if key in OPTIONAL_FIELDS:
+                continue
+            raise ValueError(
+                f"Required field '{key}' not found in any record. "
+                f"Available fields: {sorted(field_shapes.keys())}"
+            )
+
+        shapes = field_shapes[key]
+
+        # Validate scalar fields
+        if key in SCALAR_FIELDS:
+            non_scalar = [s for s in shapes if s != ()]
+            if non_scalar:
+                raise ValueError(
+                    f"Field '{key}' is declared as SCALAR but found non-scalar shapes: {non_scalar}. "
+                    f"Either fix the data collection or remove '{key}' from SCALAR_FIELDS."
+                )
+            canonical_shape: tuple = ()
+        else:
+            # Non-scalar field: verify shape consistency across all records
+            if len(shapes) > 1:
+                raise ValueError(
+                    f"Field '{key}' has inconsistent shapes across records: {shapes}. "
+                    f"Expected all records to have the same shape for this field."
+                )
+            canonical_shape = next(iter(shapes))
+
+        # Determine dtype
+        if key in INT_FIELDS:
+            canonical_dtype = np.int32
+        elif key in SCALAR_FIELDS:
+            canonical_dtype = np.int32
+        else:
+            # Float fields (logits, positions, alpha values, etc.)
+            canonical_dtype = np.float32
+
+        layout[key] = {"shape": canonical_shape, "dtype": canonical_dtype}
 
     logger.info(f"Inferred layout with {len(layout)} fields: {sorted(layout.keys())}")
-    return first_record, layout, record_count
+    for name, spec in sorted(layout.items()):
+        logger.info(f"  {name}: shape={spec['shape']}, dtype={np.dtype(spec['dtype']).name}")
 
-
-def _create_datasets(
-    h5f: "h5py.File",
-    total_records: int,
-    layout: Dict[str, Dict[str, Any]],
-    compression: Optional[str],
-) -> Dict[str, "h5py.Dataset"]:
-    datasets: Dict[str, "h5py.Dataset"] = {}
-    for name, spec in layout.items():
-        ds_shape = (total_records,) + tuple(spec["shape"])
-        chunks = True if total_records > 1 else None
-        datasets[name] = h5f.create_dataset(
-            name,
-            shape=ds_shape,
-            dtype=spec["dtype"],
-            chunks=chunks,
-            compression=compression,
-        )
-    return datasets
+    return layout, record_count
 
 
 def merge_pt_shards_to_hdf5(
     input_dir: Path,
     output_file: Path,
-    compression: Optional[str] = "gzip",
+    compression: Optional[str] = "lzf",
     logger: Optional[logging.Logger] = None,
 ) -> None:
     if logger is None:
@@ -181,41 +183,46 @@ def merge_pt_shards_to_hdf5(
     shard_paths = _list_shards(input_dir)
     logger.info(f"Found {len(shard_paths)} shards in {input_dir}")
 
-    first_record, layout, total_records = _scan_records_for_layout(shard_paths, logger)
+    # ── Pass 1: scan ALL records to infer layout & count ────────────────────
+    layout, total_records = _infer_shapes_from_all_records(shard_paths, logger)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Creating HDF5 file at {output_file} with {total_records} records...")
+
+    # ── Pre-allocate contiguous numpy arrays ─────────────────────────────────
+    logger.info(f"Pre-allocating {len(layout)} numpy arrays for {total_records} records...")
+    arrays: Dict[str, np.ndarray] = {}
+    for name, spec in layout.items():
+        arr_shape = (total_records,) + tuple(spec["shape"])
+        arrays[name] = np.empty(arr_shape, dtype=spec["dtype"])
+
+    # ── Pass 2: fill arrays from shards (fast, no HDF5 I/O) ─────────────────
+    logger.info("Loading records from shards into arrays...")
+    for row_idx, record in enumerate(
+        tqdm(_iter_records(shard_paths, show_progress=False), total=total_records, desc="Loading records")
+    ):
+        _validate_record(record, shard_hint=f"row {row_idx}")
+        for name, spec in layout.items():
+            if name in record:
+                value = _to_numpy(record[name])
+            else:
+                value = np.zeros(spec["shape"], dtype=spec["dtype"])
+
+            arr = np.asarray(value, dtype=spec["dtype"])
+            if spec["shape"] == ():
+                arrays[name][row_idx] = arr.reshape(())
+            else:
+                if arr.shape != tuple(spec["shape"]):
+                    raise ValueError(
+                        f"Shape mismatch for field '{name}' at row {row_idx}: "
+                        f"expected {spec['shape']}, got {arr.shape}"
+                    )
+                arrays[name][row_idx] = arr
+
+    # ── Pass 3: write all arrays to HDF5 in one shot per field ──────────────
+    logger.info(f"Writing {len(layout)} arrays to HDF5 (single write per field)...")
     with h5py.File(output_file, "w") as h5f:
-        datasets = _create_datasets(
-            h5f=h5f,
-            total_records=total_records,
-            layout=layout,
-            compression=compression,
-        )
-
-        logger.info("Writing records to HDF5...")
-        for row_idx, record in tqdm(
-            enumerate(_iter_records(shard_paths, show_progress=False)),
-            total=total_records,
-            desc="Writing records"
-        ):
-            _validate_record(record, shard_hint=f"row {row_idx}")
-            for name, spec in layout.items():
-                if name in record:
-                    arr = _to_numpy(record[name])
-                else:
-                    arr = np.zeros(spec["shape"], dtype=spec["dtype"])
-
-                if spec["shape"] == ():
-                    casted = np.asarray(arr, dtype=spec["dtype"]).reshape(())
-                else:
-                    casted = np.asarray(arr, dtype=spec["dtype"])
-                    if casted.shape != tuple(spec["shape"]):
-                        raise ValueError(
-                            f"Shape mismatch for field '{name}' at row {row_idx}: "
-                            f"expected {spec['shape']}, got {casted.shape}"
-                        )
-                datasets[name][row_idx] = casted
+        for name in tqdm(sorted(layout.keys()), desc="Writing HDF5 datasets"):
+            h5f.create_dataset(name, data=arrays[name], compression=compression)
 
         h5f.attrs["num_records"] = total_records
         h5f.attrs["source_input_dir"] = str(input_dir)
@@ -229,7 +236,8 @@ def merge_pt_shards_to_hdf5(
                 for name, spec in layout.items()
             }
         )
-        logger.info(f"Successfully merged {total_records} records from {len(shard_paths)} shards into {output_file}")
+
+    logger.info(f"Successfully merged {total_records} records from {len(shard_paths)} shards into {output_file}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -251,9 +259,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compression",
         type=str,
-        default="gzip",
+        default="lzf",
         choices=["gzip", "lzf", "none"],
-        help="HDF5 compression algorithm.",
+        help="HDF5 compression algorithm. Use 'lzf' for speed/reliability, 'gzip' for better ratio.",
     )
     return parser.parse_args()
 
