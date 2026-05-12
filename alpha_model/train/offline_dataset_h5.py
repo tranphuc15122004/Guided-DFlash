@@ -41,7 +41,7 @@ class HDF5BanditDataset(Dataset):
 
         self.S = self.pos_logits.shape[1]  # = block_size-1
         self.K = self.pos_logits.shape[2]  # = top_k
-        self.num_buckets = self.alpha_prev.shape[2]  # = 3
+        self.num_buckets = self.alpha_prev.shape[2]  # derive from stored alpha width
         print(f"Loaded {self.num_records} records, S={self.S}, K={self.K}, memory=~23GB")
 
     def __len__(self):

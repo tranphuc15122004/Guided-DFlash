@@ -5,7 +5,8 @@
 **Mục tiêu:** Trong cơ chế Contrastive Decoding (CD) của DFlash, hệ số alpha ($\text{logits} = \text{pos} - \alpha \cdot \text{neg}$) được cố định cho toàn bộ quá trình decode. Điều này không tối ưu vì mức độ "khác biệt" giữa positive và negative draft thay đổi theo từng token, từng block. Mục tiêu là train một mô hình RL nhẹ (`ContextualBanditAlpha`) để **điều chỉnh alpha động** cho từng token trong mỗi decode block.
 
 **Ý tưởng:** Sử dụng Actor-Critic (A2C) với:
-- **Actor** (`ContextualBanditAlpha` / `GaussianPolicy`): sinh 3 hệ số alpha cho mỗi vị trí trong block (mỗi alpha áp dụng cho một bucket rank).
+
+- **Actor** (`ContextualBanditAlpha` / `GaussianPolicy`): sinh D hệ số alpha cho mỗi vị trí trong block (mỗi alpha áp dụng cho một bucket rank).
 - **Critic**: ước lượng value function $V(s)$ để tính advantage.
 
 **Kết quả hiện tại:** Mô hình được train 70 epochs trên ~4 triệu records (gsm8k + magicoder). Training bị gián đoạn do walltime (đạt epoch 70/100). Metrics cho thấy model đang học chậm — reward cải thiện nhẹ từ -17.28 → -16.54, r1 (rank improvement) từ -13.31 → -6.37, r2 (top-1 bonus) từ 6.19 → 6.69.
@@ -33,15 +34,16 @@ Tổng input dimension: $2 \times (3K + 2 + \|ks\|) + (K + 1) + 2 + 3 = 2 \times
 ### 2.2 Action $A$
 
 Mỗi action là một bộ 3 hệ số alpha, mỗi alpha áp dụng cho một **bucket rank**:
+
 - **Bucket 0**: rank 0–10 (top tokens có xác suất cao nhất)
 - **Bucket 1**: rank 11–20
 - **Bucket 2**: rank 21+ (bao gồm cả token không nằm trong top-K)
 
 $$
-a_t \in \mathbb{R}^{(B-1) \times 3}, \quad a_t \in [-\alpha_{\max}, \alpha_{\max}],\; \alpha_{\max}=2.0
+a_t \in \mathbb{R}^{(B-1) \times D}, \quad a_t \in [-\alpha_{\max}, \alpha_{\max}],\; \alpha_{\max}=2.0
 $$
 
-Việc dùng 3 buckets thay vì alpha riêng cho từng token làm giảm độ phức tạp và giúp học dễ hơn.
+Việc dùng D buckets thay vì alpha riêng cho từng token làm giảm độ phức tạp và giúp học dễ hơn.
 
 ### 2.3 Reward $R$
 
@@ -64,7 +66,8 @@ Với $w_1=0.1, w_2=0.1, w_3=1.0, \lambda=3.0, \gamma=7$.
 ### 2.4 Transition $P$
 
 Sau khi draft model sinh positive và negative logits cho block hiện tại:
-1. Alpha model đề xuất 3 hệ số alpha (action)
+
+1. Alpha model đề xuất D hệ số alpha (action)
 2. Contrastive decoding áp dụng alpha để sinh draft tokens
 3. Target model verify, trả về acceptance length và token thật tại vị trí reject
 
@@ -84,13 +87,13 @@ Một episode = toàn bộ quá trình decode một câu trả lời (multi-turn
   - Tính entropy, top-1 margin, top-k mass (k=5,10,20)
   - Cross features: diff_logits, KL divergence
   - Ghép với positional features và alpha_prev
-- **Output:** feature vector kích thước 240
+- **Output:** feature vector kích thước phụ thuộc vào `num_alpha_buckets`
 
 ### 3.2 State Encoder (`StateEncoder`)
 
 ```python
 nn.Sequential(
-    Linear(240 → 128), GELU,
+   Linear(input_dim → 128), GELU,
     Linear(128 → 128), LayerNorm(128)
 )
 ```
@@ -104,7 +107,7 @@ nn.Sequential(
 ### 3.4 Actor Head
 
 ```python
-Linear(128 → 3)  # 3 buckets
+Linear(128 → num_alpha_buckets)
 alphas = max_alpha * tanh(logits)  # ∈ [-max_alpha, max_alpha]
 ```
 
@@ -116,6 +119,7 @@ alphas = max_alpha * tanh(logits)  # ∈ [-max_alpha, max_alpha]
 ### 3.6 GaussianPolicy (training)
 
 Kế thừa `ContextualBanditAlpha`, thêm `log_std` (3 learnable parameters) để tạo phân phối Gaussian cho reparameterization trick:
+
 ```
 mean = super().forward(...)
 log_std = self.log_std  # (3,) broadcast to (B, S, 3)
@@ -153,6 +157,7 @@ python -m alpha_model.data_collecting \
 ```
 
 **Mỗi record lưu:**
+
 - `sample_id`, `turn_index`, `block_index` — identity
 - `draft_topk_token_ids` (15, K) — int32, top-K token IDs từ positive draft
 - `draft_topk_logits` (15, K) — float32, logits tương ứng
@@ -161,7 +166,7 @@ python -m alpha_model.data_collecting \
 - `absolute_position` (15,) — normalized (0..1)
 - `target_token_id` (15,) — int32, token thật từ target model
 - `acceptance_length` () — int, số token được accept
-- `alpha_prev` (15, 3) — alpha từ block trước
+- `alpha_prev` (15, D) — alpha từ block trước
 
 **Chunking:** Cứ 2048 records → flush thành 1 file `.pt`.
 
@@ -241,6 +246,7 @@ Epoch    reward     r1         r2        r3         entropy    baseline_acc
 ```
 
 **Nhận xét:**
+
 - **r3 (acceptance length)** hầu như không đổi (~ -16.57) — model chưa học cách cải thiện acceptance length đáng kể
 - **r1 (rank improvement)** cải thiện rõ: từ -13.31 → -6.37 (giảm độ xấu của rank)
 - **r2 (top-1 bonus)** cải thiện nhẹ: 6.19 → 6.69
@@ -255,6 +261,7 @@ Epoch    reward     r1         r2        r3         entropy    baseline_acc
 ### 6.1 CD_alpha_model scheme (`scheme/CD_alpha_model.py`)
 
 Tích hợp alpha model vào DFlash generation pipeline:
+
 1. Tính positive & negative draft logits
 2. Nếu có alpha model → forward qua `ContextualBanditAlpha` để lấy 3 alphas
 3. `_build_full_alpha_from_buckets()`: mở rộng 3 alpha buckets → full vocabulary alpha mapping
@@ -263,6 +270,7 @@ Tích hợp alpha model vào DFlash generation pipeline:
 6. Sample và verify với target model
 
 **Checkpoint loading:**
+
 - Load `actor_epoch70.pt` (state dict của `GaussianPolicy`)
 - Tạo `ContextualBanditAlpha` (base class) → load với `strict=False` (bỏ qua `log_std`)
 
@@ -280,6 +288,7 @@ Tích hợp alpha model vào DFlash generation pipeline:
 ## 7. Tổng kết và Hướng phát triển
 
 ### Đã làm được
+
 ✅ Xây dựng MDP formulation hoàn chỉnh cho bài toán dynamic alpha  
 ✅ Implement actor-critic architecture với Transformer + RoPE  
 ✅ Pipeline thu thập dữ liệu offline (4M records)  
@@ -287,12 +296,14 @@ Tích hợp alpha model vào DFlash generation pipeline:
 ✅ Tích hợp inference vào DFlash pipeline  
 
 ### Cần cải thiện
+
 ❌ **r3 (acceptance length) không cải thiện** — reward function cần điều chỉnh (tăng w3, giảm penalty λ)  
 ❌ **Critic loss cao** — value estimation chưa tốt, có thể cần thêm features hoặc tăng model capacity  
 ❌ **Training chưa hội tụ** — cần thêm epochs (~200-300)  
 ❌ **Walltime limit** — 6h không đủ cho 100 epochs với 4M records; cần tối ưu data loading hoặc tăng batch size  
 
 ### Hướng phát triển
+
 1. **Tuning reward weights:** thử $w_3=2.0$ hoặc $\lambda=1.0$ để khuyến khích tăng acceptance length
 2. **Curriculum learning:** train trên các block dễ trước, khó sau
 3. **Online RL:** thay vì offline dataset, collect + train online để tránh distribution shift

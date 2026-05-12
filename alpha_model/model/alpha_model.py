@@ -40,11 +40,18 @@ class StateFeatureExtractor(nn.Module):
     Trích xuất đặc trưng từ pos_logits, neg_logits (đã được cắt top‑k)
     và các thông tin vị trí.
     """
-    def __init__(self, top_k: int = 32, ks: List[int] = [5, 10, 20], normalize_position: bool = False):
+    def __init__(
+        self,
+        top_k: int = 32,
+        ks: List[int] = [5, 10, 20],
+        normalize_position: bool = False,
+        alpha_prev_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.top_k = top_k
         self.ks = ks
         self.normalize_position = normalize_position
+        self.alpha_prev_dim = alpha_prev_dim
         # Các tham số chuẩn hóa vị trí (có thể set từ bên ngoài hoặc tính theo max)
         self.register_buffer('max_block_pos', torch.tensor(1.0))   # placeholder, sẽ gán giá trị thực tế
         self.register_buffer('max_abs_pos', torch.tensor(1.0))
@@ -54,19 +61,48 @@ class StateFeatureExtractor(nn.Module):
         self.max_block_pos.fill_(max_block_pos)
         self.max_abs_pos.fill_(max_abs_pos)
 
+    def _align_alpha_prev(
+        self,
+        alpha_prev: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.alpha_prev_dim is None:
+            return alpha_prev
+
+        if alpha_prev is None:
+            return torch.zeros(batch_size, seq_len, self.alpha_prev_dim, device=device, dtype=dtype)
+
+        if alpha_prev.dim() == 2:
+            alpha_prev = alpha_prev.unsqueeze(0)
+
+        if alpha_prev.size(-1) == self.alpha_prev_dim:
+            return alpha_prev.to(device=device, dtype=dtype)
+
+        if alpha_prev.size(-1) > self.alpha_prev_dim:
+            return alpha_prev[..., : self.alpha_prev_dim].to(device=device, dtype=dtype)
+
+        pad_width = self.alpha_prev_dim - alpha_prev.size(-1)
+        pad = torch.zeros(batch_size, seq_len, pad_width, device=device, dtype=dtype)
+        return torch.cat([alpha_prev.to(device=device, dtype=dtype), pad], dim=-1)
+
     def forward(self, pos_logits, neg_logits, block_pos, abs_pos, alpha_prev: Optional[torch.Tensor] = None):
         """
         Args:
             pos_logits, neg_logits: (B, S, top_k) - logits của các token top‑k
             block_pos: (B, S) - vị trí trong block (0..B-1)
             abs_pos: (B, S) - vị trí tuyệt đối trong toàn bộ câu
-            alpha_prev: (B, S, 3) hoặc None
+            alpha_prev: (B, S, D) hoặc None, với D = số bucket đang train
         Returns:
             features: (B, S, feature_dim)
         """
         B, S, K = pos_logits.shape
         assert neg_logits.shape == (B, S, K)
         assert block_pos.shape == (B, S) and abs_pos.shape == (B, S)
+
+        alpha_prev = self._align_alpha_prev(alpha_prev, B, S, pos_logits.device, pos_logits.dtype)
 
         # Chuẩn hóa vị trí nếu cần
         if self.normalize_position:
@@ -115,7 +151,7 @@ class StateFeatureExtractor(nn.Module):
             block_pos_norm.unsqueeze(-1), abs_pos_norm.unsqueeze(-1)
         ]
         if alpha_prev is not None:
-            features.append(alpha_prev)   # (B, S, 3)
+            features.append(alpha_prev)   # (B, S, alpha_prev_dim)
 
         return torch.cat(features, dim=-1)
 
@@ -191,24 +227,32 @@ class TransformerContext(nn.Module):
 class ContextualBanditAlpha(nn.Module):
     """
     Mạng RL sinh alpha động cho contrastive decoding.
-    Đầu ra: (B, S, num_alpha_buckets) với num_alpha_buckets = 3.
+    Đầu ra: (B, S, num_alpha_buckets).
     """
-    def __init__(self, top_k: int = 32, hidden_dim: int = 128, num_alpha_buckets: int = 3,
-                 max_alpha: float = 2.0, ks: List[int] = [5, 10, 20]):
+    def __init__(
+        self,
+        top_k: int = 32,
+        hidden_dim: int = 128,
+        num_alpha_buckets: int = 3,
+        max_alpha: float = 2.0,
+        ks: List[int] = [5, 10, 20],
+        has_alpha_prev: Optional[bool] = None,
+    ):
         super().__init__()
         self.top_k = top_k
         self.num_alpha_buckets = num_alpha_buckets
         self.max_alpha = max_alpha
+        self.has_alpha_prev = has_alpha_prev
 
         # Feature extractor
-        self.feature_extractor = StateFeatureExtractor(top_k=top_k, ks=ks)
+        self.feature_extractor = StateFeatureExtractor(top_k=top_k, ks=ks, alpha_prev_dim=num_alpha_buckets)
 
         # Tính input_dim một cách chính xác
         # Mỗi side (pos/neg): logits(K) + log_probs(K) + probs(K) + entropy(1) + margin(1) + mass(len(ks))
         per_side = 3 * top_k + 2 + len(ks)
         cross = top_k + 1          # diff_logits (K) + kl_div(1)
         pos_feat = 2               # block_pos, abs_pos (mỗi cái 1)
-        alpha_prev_dim = 3         # alpha_prev (luôn có, nếu không có thì zero)
+        alpha_prev_dim = num_alpha_buckets  # alpha_prev có cùng chiều với số bucket đang train
         input_dim = 2 * per_side + cross + pos_feat + alpha_prev_dim
         self.input_dim = input_dim
 
@@ -221,14 +265,10 @@ class ContextualBanditAlpha(nn.Module):
         Args:
             pos_logits, neg_logits: (B, S, top_k) - logits của top‑k token
             block_pos, abs_pos: (B, S) - vị trí (có thể đã chuẩn hóa hoặc chưa, feature_extractor sẽ xử lý)
-            alpha_prev: (B, S, 3) - alpha của bước trước (nếu None thì dùng zero tensor)
+            alpha_prev: (B, S, D) - alpha của bước trước; D sẽ được pad/truncate về số bucket hiện tại
         Returns:
-            alphas: (B, S, 3) - hệ số alpha cho từng bucket
+            alphas: (B, S, num_alpha_buckets) - hệ số alpha cho từng bucket
         """
-        B, S, _ = pos_logits.shape
-        if alpha_prev is None:
-            alpha_prev = torch.zeros(B, S, 3, device=pos_logits.device, dtype=pos_logits.dtype)
-
         state_feats = self.feature_extractor(pos_logits, neg_logits, block_pos, abs_pos, alpha_prev)
         x = self.encoder(state_feats)          # (B, S, hidden_dim)
         x = self.context(x)                    # (B, S, hidden_dim)
@@ -236,31 +276,148 @@ class ContextualBanditAlpha(nn.Module):
         alphas = self.max_alpha * torch.tanh(logits)   # [-max_alpha, max_alpha]
         return alphas
 
+
+# ==================== Actor: ContextualBanditAlpha 2 (dense model) ====================
+class ContextualBanditAlpha_Dense(nn.Module):
+    """
+    Dense MLP version of the alpha policy.
+
+    This variant removes the transformer stack and instead encodes the full
+    block with fully connected layers. Each token is first projected into a
+    hidden space, the block is padded to a fixed length, and the flattened
+    block representation is processed by an MLP to produce all alpha buckets.
+    """
+
+    def __init__(
+        self,
+        top_k: int = 32,
+        hidden_dim: int = 128,
+        num_alpha_buckets: int = 3,
+        max_alpha: float = 2.0,
+        ks: List[int] = [5, 10, 20],
+        max_seq_len: int = 15,
+        block_hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        has_alpha_prev: Optional[bool] = None,
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.num_alpha_buckets = num_alpha_buckets
+        self.max_alpha = max_alpha
+        self.max_seq_len = max_seq_len
+        self.has_alpha_prev = has_alpha_prev
+
+        # Feature extractor.
+        self.feature_extractor = StateFeatureExtractor(top_k=top_k, ks=ks, alpha_prev_dim=num_alpha_buckets)
+
+        # Tính input_dim một cách chính xác.
+        # Mỗi side (pos/neg): logits(K) + log_probs(K) + probs(K) + entropy(1) + margin(1) + mass(len(ks))
+        per_side = 3 * top_k + 2 + len(ks)
+        cross = top_k + 1          # diff_logits (K) + kl_div(1)
+        pos_feat = 2               # block_pos, abs_pos (mỗi cái 1)
+        alpha_prev_dim = num_alpha_buckets  # alpha_prev có cùng chiều với số bucket đang train
+        input_dim = 2 * per_side + cross + pos_feat + alpha_prev_dim
+        self.input_dim = input_dim
+
+        self.token_projector = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+
+        block_hidden_dim = block_hidden_dim or hidden_dim * 2
+        block_input_dim = max_seq_len * hidden_dim
+        self.block_mlp = nn.Sequential(
+            nn.Linear(block_input_dim, block_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(block_hidden_dim, block_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(block_hidden_dim, max_seq_len * num_alpha_buckets),
+        )
+
+    def _pad_to_max_seq_len(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, hidden_dim = x.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Dense alpha model expects seq_len <= {self.max_seq_len}, got {seq_len}."
+            )
+        if seq_len == self.max_seq_len:
+            return x
+        pad = torch.zeros(
+            batch_size,
+            self.max_seq_len - seq_len,
+            hidden_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        return torch.cat([x, pad], dim=1)
+
+    def forward(self, pos_logits, neg_logits, block_pos, abs_pos, alpha_prev: Optional[torch.Tensor] = None):
+        """
+        Args:
+            pos_logits, neg_logits: (B, S, top_k) - logits của top‑k token
+            block_pos, abs_pos: (B, S) - vị trí (có thể đã chuẩn hóa hoặc chưa, feature_extractor sẽ xử lý)
+            alpha_prev: (B, S, D) - alpha của bước trước; D sẽ được pad/truncate về số bucket hiện tại
+        Returns:
+            alphas: (B, S, num_alpha_buckets) - hệ số alpha cho từng bucket
+        """
+        batch_size, seq_len, _ = pos_logits.shape
+        state_feats = self.feature_extractor(pos_logits, neg_logits, block_pos, abs_pos, alpha_prev)
+        token_hidden = self.token_projector(state_feats)  # (B, S, hidden_dim)
+        token_hidden = self._pad_to_max_seq_len(token_hidden)
+        block_hidden = self.block_mlp(token_hidden.reshape(batch_size, -1))
+        logits = block_hidden.view(batch_size, self.max_seq_len, self.num_alpha_buckets)
+        alphas = self.max_alpha * torch.tanh(logits[:, :seq_len, :])
+        return alphas
+
+
 # ==================== Critic (giá trị value) ====================
 class Critic(nn.Module):
     """
-    Mạng ước tính value function V(s). Nhận state giống actor, trả về giá trị (B, S).
+    Mạng ước tính value function V(s).
+
+    Hỗ trợ hai chế độ:
+    - input_dim: nhận sẵn feature vector (phục vụ pipeline cũ)
+    - top_k: tự trích xuất feature từ logits/positions/alpha_prev (phục vụ alpha training mới)
     """
-    def __init__(self, top_k: int = 32, hidden_dim: int = 128, ks: List[int] = [5, 10, 20]):
+    def __init__(
+        self,
+        input_dim: Optional[int] = None,
+        top_k: Optional[int] = None,
+        hidden_dim: int = 128,
+        num_alpha_buckets: int = 3,
+        ks: List[int] = [5, 10, 20],
+    ):
         super().__init__()
-        self.feature_extractor = StateFeatureExtractor(top_k=top_k, ks=ks)
-        # Tính input_dim giống actor
-        per_side = 3 * top_k + 2 + len(ks)
-        cross = top_k + 1
-        pos_feat = 2
-        alpha_prev_dim = 3
-        input_dim = 2 * per_side + cross + pos_feat + alpha_prev_dim
-        self.encoder = StateEncoder(input_dim, hidden_dim)
+        self.num_alpha_buckets = num_alpha_buckets
+
+        if input_dim is not None:
+            self.feature_extractor = None
+            encoder_input_dim = input_dim
+        else:
+            if top_k is None:
+                raise ValueError("Critic requires either input_dim or top_k.")
+            self.feature_extractor = StateFeatureExtractor(top_k=top_k, ks=ks, alpha_prev_dim=num_alpha_buckets)
+            per_side = 3 * top_k + 2 + len(ks)
+            cross = top_k + 1
+            pos_feat = 2
+            alpha_prev_dim = num_alpha_buckets
+            encoder_input_dim = 2 * per_side + cross + pos_feat + alpha_prev_dim
+
+        self.encoder = StateEncoder(encoder_input_dim, hidden_dim)
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, pos_logits, neg_logits, block_pos, abs_pos, alpha_prev: Optional[torch.Tensor] = None):
-        if alpha_prev is None:
-            alpha_prev = torch.zeros_like(pos_logits[..., :3])  # giả định (B,S,3)
-        state_feats = self.feature_extractor(pos_logits, neg_logits, block_pos, abs_pos, alpha_prev)
+    def forward(self, pos_logits, neg_logits=None, block_pos=None, abs_pos=None, alpha_prev: Optional[torch.Tensor] = None):
+        if self.feature_extractor is None:
+            state_feats = pos_logits
+        else:
+            state_feats = self.feature_extractor(pos_logits, neg_logits, block_pos, abs_pos, alpha_prev)
         x = self.encoder(state_feats)
         values = self.value_head(x).squeeze(-1)   # (B, S)
         return values

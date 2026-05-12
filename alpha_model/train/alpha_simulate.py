@@ -2,9 +2,14 @@ import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
 
-def compute_bucket_thresholds(topk: int, num_buckets: int) -> List[int]:
-    bucket_size = topk // num_buckets
-    thresholds = [(i + 1) * bucket_size for i in range(num_buckets - 1)]
+def compute_bucket_thresholds(topk: int, num_buckets: int, bucket_size: Optional[int] = None) -> List[int]:
+    if num_buckets <= 1:
+        return []
+
+    if bucket_size is None or bucket_size <= 0:
+        bucket_size = max(topk // num_buckets, 1)
+
+    thresholds = [min((i + 1) * bucket_size, topk) for i in range(num_buckets - 1)]
     return thresholds
 
 def get_rank_in_topk_batch(
@@ -23,11 +28,12 @@ def get_bucket_from_rank_batch(
     ranks: torch.Tensor,        # (B, S)
     thresholds: List[int],
 ) -> torch.Tensor:
-    buckets = torch.zeros_like(ranks, dtype=torch.long)
-    for i, th in enumerate(thresholds):
-        buckets = torch.where(ranks < th, torch.full_like(buckets, i), buckets)
-    buckets = torch.where(ranks >= thresholds[-1], torch.full_like(buckets, len(thresholds)), buckets)
-    return buckets  # (B, S)
+    if len(thresholds) == 0:
+        return torch.zeros_like(ranks, dtype=torch.long)
+
+    boundary = torch.as_tensor(thresholds, device=ranks.device, dtype=ranks.dtype)
+    buckets = torch.bucketize(ranks, boundary, right=False)
+    return buckets.to(torch.long)  # (B, S)
 
 def apply_contrastive_batch(
     pos_logits: torch.Tensor,   # (B, S, K)
@@ -163,10 +169,88 @@ def total_reward_batch(r1: torch.Tensor, r2: torch.Tensor, r3: torch.Tensor,
     return w1 * r1 + w2 * r2 + w3 * r3
 
 
+def _check_alpha_value(
+    pos_logits: torch.Tensor,           # (B, S, K)
+    topk_token_ids: torch.Tensor,       # (B, S, K)
+    target_token_ids: torch.Tensor,     # (B, S)
+    alpha_per_token: torch.Tensor,      # (B, S, num_buckets)
+    bucket_thresholds: Optional[List[int]] = None,
+    atol: float = 1e-6,
+):
+    B, S, num_buckets = alpha_per_token.shape
+    K = topk_token_ids.shape[-1]
+    device = alpha_per_token.device
+
+    if bucket_thresholds is None:
+        bucket_thresholds = compute_bucket_thresholds(K, num_buckets)
+
+    ranks = get_rank_in_topk_batch(target_token_ids, topk_token_ids)
+    true_buckets = get_bucket_from_rank_batch(ranks, bucket_thresholds)
+
+    batch_idx = torch.arange(B, device=device).unsqueeze(-1).expand(-1, S)
+    token_idx = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+    target_alpha = alpha_per_token[batch_idx, token_idx, true_buckets]
+
+    min_alpha, min_alpha_bucket = alpha_per_token.min(dim=-1)
+    sorted_alpha = torch.sort(alpha_per_token, dim=-1).values
+    second_min_alpha = sorted_alpha[..., 1] if num_buckets > 1 else min_alpha
+
+    strict_correct = (min_alpha_bucket == true_buckets)
+    tie_correct = target_alpha <= (min_alpha + atol)
+
+    bucket_counts = torch.bincount(true_buckets.reshape(-1), minlength=num_buckets)
+    pred_min_bucket_counts = torch.bincount(min_alpha_bucket.reshape(-1), minlength=num_buckets)
+
+    total_count = bucket_counts.sum().clamp_min(1).to(torch.float32)
+    bucket_rates = (bucket_counts.to(torch.float32) / total_count).tolist()
+    pred_min_bucket_rates = (
+        pred_min_bucket_counts.to(torch.float32)
+        / pred_min_bucket_counts.sum().clamp_min(1).to(torch.float32)
+    ).tolist()
+
+    alpha_gap = target_alpha - min_alpha
+    alpha_margin = second_min_alpha - min_alpha
+
+    strict_min_alpha_bucket_acc = strict_correct.float().mean().item()
+    min_alpha_bucket_acc = tie_correct.float().mean().item()
+    target_in_topk_rate = (ranks < K).float().mean().item()
+
+    per_bucket_acc = {}
+    per_bucket_tie_acc = {}
+    for bucket in range(num_buckets):
+        mask = (true_buckets == bucket)
+        if mask.sum() > 0:
+            per_bucket_acc[bucket] = strict_correct[mask].float().mean().item()
+            per_bucket_tie_acc[bucket] = tie_correct[mask].float().mean().item()
+        else:
+            per_bucket_acc[bucket] = 0.0
+            per_bucket_tie_acc[bucket] = 0.0
+
+    return {
+        "min_alpha_bucket_acc": min_alpha_bucket_acc,
+        "strict_min_alpha_bucket_acc": strict_min_alpha_bucket_acc,
+        "target_bucket_tie_acc": min_alpha_bucket_acc,
+        "per_bucket_acc": per_bucket_acc,
+        "per_bucket_tie_acc": per_bucket_tie_acc,
+        "bucket_counts": bucket_counts.tolist(),
+        "bucket_rates": bucket_rates,
+        "pred_min_bucket_counts": pred_min_bucket_counts.tolist(),
+        "pred_min_bucket_rates": pred_min_bucket_rates,
+        "target_in_topk_rate": target_in_topk_rate,
+        "target_outside_topk_rate": 1.0 - target_in_topk_rate,
+        "alpha_gap_mean": alpha_gap.mean().item(),
+        "alpha_gap_std": alpha_gap.std(unbiased=False).item() if alpha_gap.numel() > 1 else 0.0,
+        "alpha_margin_mean": alpha_margin.mean().item(),
+        "alpha_margin_std": alpha_margin.std(unbiased=False).item() if alpha_margin.numel() > 1 else 0.0,
+    }
+
+
+
 # Backward-compatible aliases used by training code and the local smoke test.
 simulate_acceptance_length_vectorized = simulate_acceptance_length_batch
 compute_reward_components_vectorized = compute_reward_components_batch
 total_reward = total_reward_batch
+check_alpha_value = _check_alpha_value
 
 
 def _ensure_batched_inputs(

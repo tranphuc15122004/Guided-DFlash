@@ -59,9 +59,9 @@ In total: 52,473
 - **acceptance_length**: int — số token được chấp nhận ở block này (giá trị lưu là int(acceptance_length + 1) theo code).
     - Cách tính:acceptance_length_var = (block_output_ids[:,1:] == posterior[:,:-1]).cumprod(dim=1).sum(dim=1)[0].item()stored = acceptance_length_var + 1
     - Ý nghĩa: số token liên tiếp đầu tiên trong block được target chấp nhận (tức block_output_ids[:, :stored] là các token accepted). Giá trị ∈ [1, block_size].
-- **alpha_prev**: float32 tensor, shape (S-1, 3) — alpha từ block trước (per-position, 3 buckets), nếu có; lưu dạng CPU.
-    - Trong code khởi tạo alpha_prev có kích thước `(1, max(block_size-1,1), 3)` và trước khi lưu dùng .squeeze(0).
-- **alpha_applied**: float32 tensor, shape (S-1, 3) — alpha đã được áp dụng cho block hiện tại (per-position, 3 buckets), lưu CPU.
+- **alpha_prev**: float32 tensor, shape (S-1, D) — alpha từ block trước (per-position, D buckets), nếu có; lưu dạng CPU.
+    - Trong code khởi tạo alpha_prev có kích thước `(1, max(block_size-1,1), D)` với `D = ceil(collector_topk / bucket_size)`, và trước khi lưu dùng .squeeze(0).
+- **alpha_applied**: float32 tensor, shape (S-1, D) — alpha đã được áp dụng cho block hiện tại (per-position, D buckets), lưu CPU.
 '''
 
 
@@ -95,6 +95,12 @@ class BlockRecordWriter:
 
     def close(self) -> None:
         self.flush()
+
+
+def infer_num_buckets(top_k: int, bucket_size: int) -> int:
+    if bucket_size <= 0:
+        raise ValueError("bucket_size must be positive")
+    return max((top_k + bucket_size - 1) // bucket_size, 1)
 
 
 def _dataset_length(dataset: Any) -> Optional[int]:
@@ -368,6 +374,7 @@ def dflash_generate(
     collector_topk: int = 32,
     collector: Optional[BlockRecordWriter] = None,
     seed: int = 0,
+    bucket_size: int = 8,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
     gen.manual_seed(seed)
@@ -408,8 +415,9 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
-    alpha_prev = torch.zeros((1, max(block_size - 1, 1), 3), dtype=torch.float32, device=model.device)
-    alpha_current = torch.full((1, max(block_size - 1, 1), 3), float(cd_alpha), dtype=torch.float32, device=model.device)
+    alpha_width = infer_num_buckets(collector_topk, bucket_size)
+    alpha_prev = torch.zeros((1, max(block_size - 1, 1), alpha_width), dtype=torch.float32, device=model.device)
+    alpha_current = torch.full((1, max(block_size - 1, 1), alpha_width), float(cd_alpha), dtype=torch.float32, device=model.device)
     block_index = 0
 
     while start < max_length:
@@ -587,6 +595,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cd-alpha", type=float, default=0.1)
     parser.add_argument("--cd-beta", type=float, default=0.0)
+    parser.add_argument(
+        "--bucket-size",
+        type=int,
+        default=8,
+        help="bucket width; alpha bucket count is inferred as ceil(collector_topk / bucket_size)",
+    )
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
@@ -628,6 +642,8 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    if args.bucket_size <= 0:
+        parser.error("--bucket-size must be positive")
     NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
     print(f"Using negative hidden mode: [bold magenta]{args.negative_hidden_mode}[/bold magenta]")
 
@@ -672,6 +688,10 @@ def main() -> None:
     ).to(device).eval()
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    print(
+        f"Bucket config: collector_topk={args.collector_topk}, "
+        f"bucket_size={args.bucket_size}, num_buckets={infer_num_buckets(args.collector_topk, args.bucket_size)}"
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     dataset = load_and_process_dataset_ALPHA(
@@ -743,6 +763,7 @@ def main() -> None:
                     collector_topk=args.collector_topk,
                     collector=collector if bs == block_size else None,
                     seed = sample_seed + bs,
+                    bucket_size=args.bucket_size,
                 )
             
             spec_response = response[block_size]
