@@ -1,0 +1,89 @@
+================================================================================
+ALPHA BUCKET RECOGNITION ANALYSIS REPORT
+================================================================================
+
+Training epochs analyzed: 95 (epochs 1 to 95)
+Number of buckets: 11 (IDs: 0–10)
+
+--------------------------------------------------------------------------------
+1. CORE QUESTION: Can the model assign minimum alpha to target's bucket?
+--------------------------------------------------------------------------------
+
+  Metric                    First epoch  Last epoch  Change    Relative
+  ──────────────────────────────────────────────────────────────────────
+  min_alpha_bucket_acc:      0.2024      0.2700      +0.0676   +33.4%
+  strict_min_alpha_acc:      0.1761      0.2366      +0.0604   +34.3%
+  Random baseline:           0.0909 (1/11 per bucket)
+  Lift over random:          197.0%
+  Upper bound (target in     0.9162
+    top-32 rate):
+  Gap to upper bound:        64.6 pp
+
+  → The model IMPROVES (33% relative gain)
+    but is still far from the upper bound. Only ~27.0% of the time does
+    the globally minimum alpha land on the target's bucket.
+
+--------------------------------------------------------------------------------
+2. BUCKET DISTRIBUTION ANALYSIS
+--------------------------------------------------------------------------------
+
+  True bucket distribution (where target tokens fall):
+    Bucket  True Rate  Pred Rate        Gap  Alpha (last)   Cond Acc
+  ----------------------------------------------------------------
+         0     0.7234     0.3053    -0.4181        0.2969     42.20%
+         1     0.0678     0.1471    +0.0793        0.1479    100.00%
+         2     0.0373     0.0883    +0.0511        0.0904    100.00%
+         3     0.0242     0.0733    +0.0491        0.0747    100.00%
+         4     0.0174     0.0723    +0.0549        0.0735    100.00%
+         5     0.0129     0.0592    +0.0462        0.0509    100.00%
+         6     0.0103     0.0612    +0.0509        0.0597    100.00%
+         7     0.0083     0.0561    +0.0478        0.0551    100.00%
+         8     0.0069     0.0517    +0.0448        0.0430    100.00%
+         9     0.0059     0.0417    +0.0358        0.0396    100.00%
+        10     0.0855     0.0438    -0.0417        0.0363     51.21%
+
+  L1 alignment (first epoch): 1.0804
+  L1 alignment (last epoch):  0.9197
+
+--------------------------------------------------------------------------------
+3. PER-BUCKET ALPHA TRENDS
+--------------------------------------------------------------------------------
+
+    Bucket   Start α     End α    Change   Change %       Slope
+  ------------------------------------------------------
+         0    0.2091    0.2969   +0.0878     +42.0%  +0.000500
+         1    0.1710    0.1479   -0.0231     -13.5%  -0.000279
+         2    0.1071    0.0904   -0.0167     -15.6%  -0.000122
+         3    0.0811    0.0747   -0.0064      -7.9%  -0.000042
+         4    0.0829    0.0735   -0.0094     -11.3%  -0.000049
+         5    0.0635    0.0509   -0.0126     -19.8%  -0.000039
+         6    0.0675    0.0597   -0.0078     -11.5%  -0.000017
+         7    0.0617    0.0551   -0.0066     -10.6%  -0.000012
+         8    0.0457    0.0430   -0.0027      -5.9%  -0.000001
+         9    0.0403    0.0396   -0.0007      -1.9%  -0.000006
+        10    0.0390    0.0363   -0.0027      -6.8%  +0.000014
+
+  → Alpha values generally INCREASE for low buckets and are more stable
+    for mid-range buckets. This widens the alpha gap over training.
+
+--------------------------------------------------------------------------------
+4. KEY INSIGHT: Does the model actually learn?
+--------------------------------------------------------------------------------
+
+  YES, partially. The evidence:
+  - min_alpha_bucket_acc improves from 0.202 to 0.270
+    (33% relative improvement)
+  - L1 alignment improves from 1.080 to 0.920
+  - The alpha gap grows, showing the model is learning to differentiate buckets
+
+  BUT, the limitations are clear:
+  - The macro bucket accuracy (~0.270) is only 297% better than random
+  - The model systematically underestimates the min-alpha assignment for bucket 0
+    (true rate = 0.7234 but pred rate = 0.3053)
+  - The conditional accuracy P(pred=B | true=B) is low for most buckets
+
+  Root cause hypothesis: The model primarily learns to widen the alpha gap
+  between buckets as a coarse strategy, but struggles with fine-grained
+  per-token bucket identification. The contextual bandit formulation may
+  need more capacity (larger hidden dim) or a different reward structure
+  to properly learn bucket recognition.

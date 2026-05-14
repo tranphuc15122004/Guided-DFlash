@@ -13,7 +13,7 @@ from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
-from alpha_model import ContextualBanditAlpha
+from alpha_model import ContextualBanditAlpha, ContextualBanditAlpha_Dense
 import distributed as dist
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
@@ -334,6 +334,7 @@ def dflash_generate(
     divergence_accumulator: Optional[List[float]] = None,
     alpha_model: Optional[ContextualBanditAlpha] = None,
     alpha_top_k: int = 32,
+    num_alpha_buckets: int = 3,
     seed: int = 0,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
@@ -375,7 +376,7 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
-    alpha_prev = torch.zeros((1, max(block_size - 1, 1), 3), dtype=torch.float32, device=model.device)
+    alpha_prev = torch.zeros((1, max(block_size - 1, 1), num_alpha_buckets), dtype=torch.float32, device=model.device)
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -409,7 +410,7 @@ def dflash_generate(
                     top_k=64,
                 )
             
-            alphas_per_bucket = torch.full((1, max(block_size - 1, 1), 3), cd_alpha, dtype=torch.float32, device=model.device)
+            alphas_per_bucket = torch.full((1, max(block_size - 1, 1), num_alpha_buckets), cd_alpha, dtype=torch.float32, device=model.device)
             if alpha_model is not None:
                 if divergence_accumulator is not None:
                     kl_val = _compute_kl_divergence(positive_draft_logits, negative_draft_logits)
@@ -469,8 +470,8 @@ def dflash_generate(
             )
             
             # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
-            n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            """ n_keep = min(6, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -493,7 +494,7 @@ def dflash_generate(
         acceptance_lengths.append(acceptance_length+1)
         start += acceptance_length + 1
         if block_size > 1:
-            alpha_prev = alphas_per_bucket if alpha_model is not None else torch.full((1, max(block_size - 1, 1), 3), cd_alpha, dtype=torch.float32, device=model.device)
+            alpha_prev = alphas_per_bucket if alpha_model is not None else torch.full((1, max(block_size - 1, 1), num_alpha_buckets), cd_alpha, dtype=torch.float32, device=model.device)
         past_key_values_target.crop(start)
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
@@ -523,6 +524,93 @@ def dflash_generate(
         time_per_output_token=time_per_output_token,
         acceptance_lengths=acceptance_lengths,
     )
+
+
+def _detect_model_type(state_dict: dict) -> str:
+    if 'encoder.net.0.weight' in state_dict:
+        return 'regular'
+    if 'token_projector.0.weight' in state_dict:
+        return 'dense'
+    raise ValueError(
+        "Unknown alpha model type. Expected keys 'encoder.net.0.weight' "
+        "(regular) or 'token_projector.0.weight' (dense). "
+        f"Got keys: {list(state_dict.keys())[:10]}..."
+    )
+
+
+def _infer_topk_from_input_dim(
+    input_dim: int,
+    num_alpha_buckets: int,
+    len_ks: int,
+) -> tuple[int, int]:
+    candidates = []
+    for alt_len_ks in range(1, 7):
+        numerator = input_dim - 7 - 2 * alt_len_ks - num_alpha_buckets
+        if numerator > 0 and numerator % 7 == 0:
+            top_k = numerator // 7
+            if 1 <= top_k <= 512:
+                candidates.append((alt_len_ks, top_k))
+    if not candidates:
+        raise ValueError(
+            f"Cannot infer top_k from input_dim={input_dim}, "
+            f"num_alpha_buckets={num_alpha_buckets}. "
+            f"No valid (len_ks, top_k) combination found."
+        )
+    chosen = next((c for c in candidates if c[0] == len_ks), candidates[0])
+    if chosen[0] != len_ks:
+        logger.warning(f"Inferred len(ks)={chosen[0]} instead of default {len_ks}.")
+    return chosen[1], chosen[0]
+
+
+def infer_alpha_model_config(
+    state_dict: dict,
+    default_ks: Optional[list[int]] = None,
+) -> dict:
+    if default_ks is None:
+        default_ks = [5, 10, 20]
+    len_ks = len(default_ks)
+    model_type = _detect_model_type(state_dict)
+
+    if model_type == 'regular':
+        num_alpha_buckets = state_dict['alpha_head.weight'].shape[0]
+        input_dim = state_dict['encoder.net.0.weight'].shape[1]
+        top_k, inferred_len_ks = _infer_topk_from_input_dim(input_dim, num_alpha_buckets, len_ks)
+        return {
+            'model_type': 'regular',
+            'top_k': top_k,
+            'num_alpha_buckets': num_alpha_buckets,
+            'len_ks': inferred_len_ks,
+        }
+
+    # Dense model
+    input_dim = state_dict['token_projector.0.weight'].shape[1]
+    output_dim = state_dict['block_mlp.6.weight'].shape[0]
+
+    num_alpha_buckets = None
+    max_seq_len = None
+    for candidate_seq_len in [15, 7, 31, 63]:
+        if output_dim % candidate_seq_len == 0:
+            candidate_buckets = output_dim // candidate_seq_len
+            numerator = input_dim - 7 - 2 * len_ks - candidate_buckets
+            if numerator > 0 and numerator % 7 == 0 and numerator // 7 <= 512:
+                num_alpha_buckets = candidate_buckets
+                max_seq_len = candidate_seq_len
+                break
+
+    if num_alpha_buckets is None:
+        raise ValueError(
+            f"Cannot infer num_alpha_buckets from Dense checkpoint: "
+            f"output_dim={output_dim}, input_dim={input_dim}."
+        )
+
+    top_k, inferred_len_ks = _infer_topk_from_input_dim(input_dim, num_alpha_buckets, len_ks)
+    return {
+        'model_type': 'dense',
+        'top_k': top_k,
+        'num_alpha_buckets': num_alpha_buckets,
+        'len_ks': inferred_len_ks,
+        'max_seq_len': max_seq_len,
+    }
 
 
 def main() -> None:
@@ -563,7 +651,7 @@ def main() -> None:
         "--alpha-top-k",
         type=int,
         default=32,
-        help="Top-k logits to feed into the alpha model.",
+        help="Top-k logits to feed into the alpha model. Auto-inferred from checkpoint when --alpha-model-path is provided.",
     )
     args = parser.parse_args()
     NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
@@ -610,14 +698,40 @@ def main() -> None:
     ).to(device).eval()
 
     alpha_model: Optional[ContextualBanditAlpha] = None
+    alpha_num_buckets: int = 3
+    alpha_inferred_top_k: int = args.alpha_top_k
     if args.alpha_model_path is not None:
-        alpha_model = ContextualBanditAlpha(top_k=args.alpha_top_k, hidden_dim=128, num_alpha_buckets=3, max_alpha=2.0)
         alpha_model_state = torch.load(args.alpha_model_path, map_location=device, weights_only=True)
         if isinstance(alpha_model_state, dict):
             for state_key in ("state_dict", "model_state_dict", "actor_state_dict"):
                 if state_key in alpha_model_state and isinstance(alpha_model_state[state_key], dict):
                     alpha_model_state = alpha_model_state[state_key]
                     break
+        inferred = infer_alpha_model_config(alpha_model_state)
+        inferred_top_k = inferred['top_k']
+        alpha_num_buckets = inferred['num_alpha_buckets']
+        alpha_inferred_top_k = inferred_top_k
+        if inferred_top_k != args.alpha_top_k:
+            logger.info(
+                f"Overriding --alpha-top-k={args.alpha_top_k} with inferred "
+                f"top_k={inferred_top_k} from checkpoint."
+            )
+        model_type = inferred.get('model_type', 'regular')
+        if model_type == 'dense':
+            alpha_model = ContextualBanditAlpha_Dense(
+                top_k=inferred_top_k,
+                hidden_dim=128,
+                num_alpha_buckets=alpha_num_buckets,
+                max_alpha=2.0,
+                max_seq_len=inferred.get('max_seq_len', 15),
+            )
+        else:
+            alpha_model = ContextualBanditAlpha(
+                top_k=inferred_top_k,
+                hidden_dim=128,
+                num_alpha_buckets=alpha_num_buckets,
+                max_alpha=2.0,
+            )
         load_result = alpha_model.load_state_dict(alpha_model_state, strict=False)
         if load_result.missing_keys:
             logger.info(f"Alpha model missing keys during load: {load_result.missing_keys}")
@@ -625,6 +739,7 @@ def main() -> None:
             logger.info(f"Alpha model unexpected keys during load: {load_result.unexpected_keys}")
         alpha_model.to(device).eval()
         print(f"[bold green]Loaded alpha model from {args.alpha_model_path}[/bold green]")
+        print(f"[bold cyan]  Inferred config: type={model_type}, top_k={inferred_top_k}, num_buckets={alpha_num_buckets}[/bold cyan]")
     else:
         print(f"[bold yellow]No alpha model provided. Using fixed cd-alpha={args.cd_alpha}[/bold yellow]")
 
@@ -669,7 +784,8 @@ def main() -> None:
                     negative_hidden_mode=args.negative_hidden_mode,
                     divergence_accumulator = divergence_accumulator,
                     alpha_model = alpha_model if bs > 1 else None,
-                    alpha_top_k = args.alpha_top_k,
+                    alpha_top_k = alpha_inferred_top_k,
+                    num_alpha_buckets = alpha_num_buckets,
                     seed = sample_seed + bs,
                 )
             

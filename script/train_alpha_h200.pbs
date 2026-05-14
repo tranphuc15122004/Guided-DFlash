@@ -38,16 +38,16 @@ EPOCHS="${EPOCHS:-100}"
 LR="${LR:-1e-4}"
 TOP_K="${TOP_K:-32}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
-NUM_BUCKETS="${NUM_BUCKETS:-3}"
+BUCKET_SIZE="${BUCKET_SIZE:-3}"
 MAX_ALPHA="${MAX_ALPHA:-2.0}"
 GAMMA_DECAY="${GAMMA_DECAY:-7.0}"
 LAMBDA_R3="${LAMBDA_R3:-3.0}"
 W1="${W1:-0.1}"
 W2="${W2:-0.1}"
-W3="${W3:-1.0}"
+W3="${W3:-0.7}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.01}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 
 # ── Debug mode: use subset if DEBUG=1 ──
 # Usage: qsub -v DEBUG=1 script/train_alpha_h200.pbs
@@ -68,7 +68,7 @@ echo "EPOCHS: $EPOCHS"
 echo "LR: $LR"
 echo "TOP_K: $TOP_K"
 echo "HIDDEN_DIM: $HIDDEN_DIM"
-echo "NUM_BUCKETS: $NUM_BUCKETS"
+echo "BUCKET_SIZE: $BUCKET_SIZE"
 echo "MAX_ALPHA: $MAX_ALPHA"
 echo "GAMMA_DECAY: $GAMMA_DECAY"
 echo "LAMBDA_R3: $LAMBDA_R3"
@@ -90,7 +90,7 @@ time python -m alpha_model.train.train_AC \
   --lr "$LR" \
   --top-k "$TOP_K" \
   --hidden-dim "$HIDDEN_DIM" \
-  --num-buckets "$NUM_BUCKETS" \
+  --bucket-size "$BUCKET_SIZE" \
   --max-alpha "$MAX_ALPHA" \
   --gamma-decay "$GAMMA_DECAY" \
   --lambda-r3 "$LAMBDA_R3" \

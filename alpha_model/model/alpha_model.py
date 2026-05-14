@@ -291,7 +291,7 @@ class ContextualBanditAlpha_Dense(nn.Module):
     def __init__(
         self,
         top_k: int = 32,
-        hidden_dim: int = 128,
+        hidden_dim: int = 512,
         num_alpha_buckets: int = 3,
         max_alpha: float = 2.0,
         ks: List[int] = [5, 10, 20],

@@ -4,10 +4,9 @@
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=24GB
-#PBS -l walltime=00:20:00
+#PBS -l walltime=00:45:00
 #PBS -l storage=scratch/jp09+gdata/hn98
 #PBS -j oe
-#PBS -V
 
 set -euo pipefail
 
@@ -25,8 +24,9 @@ export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
 
-SCHEME="cd_alpha_model"
+SCHEME=${SCHEME:-CD_alpha_model}
 DATASET="gsm8k"
 MAX_SAMPLES=32
 MAX_NEW_TOKENS=2048
@@ -35,7 +35,7 @@ CD_ALPHA=0.6
 CD_BETA=0.0
 NEG_DROPOUT=0.3
 NEG_HIDDEN_MODE="mask_zero"
-ALPHA_MODEL_PATH="${ALPHA_MODEL_PATH:-}"
+ALPHA_MODEL_PATH="${ALPHA_MODEL_PATH:-checkpoints/alpha_trained_168218529.gadi-pbs/actor_best.pt}"
 ALPHA_TOP_K=32
 
 ALPHA_MODEL_ARG=""
@@ -60,7 +60,7 @@ echo "NEG_DROPOUT: $NEG_DROPOUT"
 echo "NEG_HIDDEN_MODE: $NEG_HIDDEN_MODE"
 echo "========================================================"
 
-python -m scheme.CD_alpha_model \
+python -m scheme."$SCHEME" \
   --model-name-or-path Qwen/Qwen3-4B \
   --draft-name-or-path z-lab/Qwen3-4B-DFlash-b16 \
   --dataset "$DATASET" \
