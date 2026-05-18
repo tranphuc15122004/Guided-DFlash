@@ -1049,8 +1049,8 @@ def dflash_generate(
             cd_final_logits = cd_masked_logits.clone()
             
             # Keep early draft positions close to positive branch to reduce unstable trajectory drift.
-            n_keep = min(FINAL_OVERRIDE_KEEP, cd_final_logits.size(1))
-            cd_final_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            """ n_keep = min(FINAL_OVERRIDE_KEEP, cd_final_logits.size(1))
+            cd_final_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
             
             block_output_ids[:, 1:] = sample(cd_final_logits , gen=gen)
             if draft_prefill:

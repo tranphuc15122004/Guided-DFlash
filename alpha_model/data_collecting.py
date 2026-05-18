@@ -504,18 +504,54 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = cuda_time()
 
-        output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            output_hidden_states=True if block_size > 1 else False,
-        )
+        if block_size > 1:
+            # Auto-regressive target generation for block verification
+            ar_tokens_list = [block_output_ids[:, 0:1]]  # start with the prefix token
+            ar_hidden_list = []
 
-        posterior = sample(output.logits, temperature , gen=gen)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+            for ar_step in range(block_size):
+                ar_input = ar_tokens_list[-1]
+                ar_pos = block_position_ids[:, ar_step:ar_step+1]
+
+                ar_output = target(
+                    ar_input,
+                    position_ids=ar_pos,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+
+                # Collect hidden state for this block position
+                hs = extract_context_feature(ar_output.hidden_states, model.target_layer_ids)
+                ar_hidden_list.append(hs)
+
+                # Generate next token (including the bonus token beyond the block)
+                next_token = sample(ar_output.logits[:, -1:, :], temperature, gen=gen)
+                ar_tokens_list.append(next_token)
+
+            # Concatenate: (1, block_size+1) = [prefix, ar_token_1, ..., ar_token_{block_size-1}, bonus_token]
+            ar_tokens = torch.cat(ar_tokens_list, dim=1)
+            # ar_hidden: (1, block_size, hidden_dim) — one per block position (0..block_size-1)
+            ar_hidden = torch.cat(ar_hidden_list, dim=1)
+
+            # Verification: compare draft (pos 1..block_size-1) vs AR tokens (same range)
+            acceptance_length = (block_output_ids[:, 1:] == ar_tokens[:, 1:block_size]).cumprod(dim=1).sum(dim=1)[0].item()
+            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+            output_ids[:, start + acceptance_length + 1] = ar_tokens[:, acceptance_length + 1]
+            target_token_id_for_record = ar_tokens[:, 1:block_size]
+        else:
+            output = target(
+                block_output_ids,
+                position_ids=block_position_ids,
+                past_key_values=past_key_values_target,
+                use_cache=True,
+                output_hidden_states=False,
+            )
+            posterior = sample(output.logits, temperature, gen=gen)
+            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+            output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+            target_token_id_for_record = posterior[:, :-1]
 
         acceptance_lengths.append(acceptance_length+1)
         if collector is not None and block_record_payload is not None:
@@ -529,7 +565,7 @@ def dflash_generate(
                     "neg_logits_on_draft_topk_ids": block_record_payload["neg_logits_on_draft_topk_ids"].to(torch.float32).squeeze(0).detach().cpu(),
                     "block_position": block_record_payload["block_position"].to(torch.float32).squeeze(0).detach().cpu(),
                     "absolute_position": block_record_payload["absolute_position"].to(torch.float32).squeeze(0).detach().cpu(),
-                    "target_token_id": posterior[:, :-1].to(torch.int32).squeeze(0).detach().cpu(),
+                    "target_token_id": target_token_id_for_record.to(torch.int32).squeeze(0).detach().cpu(),
                     "acceptance_length": int(acceptance_length + 1),
                     "alpha_prev": block_record_payload["alpha_prev"].to(torch.float32).squeeze(0).detach().cpu(),
                     "alpha_applied": block_record_payload["alpha_applied"].to(torch.float32).squeeze(0).detach().cpu(),
@@ -542,7 +578,7 @@ def dflash_generate(
             alpha_prev = alpha_current
         past_key_values_target.crop(start)
         if block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
+            target_hidden = ar_hidden[:, :acceptance_length + 1, :]
         
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids

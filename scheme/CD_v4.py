@@ -16,6 +16,7 @@ from analysis import token_level_core
 from analysis import token_level_reporting
 from model import *
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 """ 
 Contrastive decoding with CD candidate filtering and enhanced negative sampling for the draft model.
@@ -424,6 +425,7 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    log_run_parameters("CD_v4", args)
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 

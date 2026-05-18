@@ -13,8 +13,10 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 """ 
+    log_run_parameters("CD_v3", args)
 Contrastive decoding with CD candidate filtering and enhanced negative sampling for the draft model.
 Key features:
 Similar to the previous version but negative sample generation.

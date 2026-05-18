@@ -13,6 +13,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
 TOP64_MASK_MODE = False 
@@ -343,8 +344,8 @@ def dflash_generate(
             )
             
             # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
-            n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            """ n_keep = min(6, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -409,7 +410,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cd-alpha", type=float, default=0.6)
     parser.add_argument("--cd-beta", type=float, default=0.0)
-    parser.add_argument("--negative-context-dropout", type=float, default=0.3)
+    parser.add_argument("--negative-context-dropout", type=float, default=1.0)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
         "--negative-hidden-mode",
@@ -426,6 +427,7 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    log_run_parameters("CD_v2", args)
     NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
     print(f"Using negative hidden mode: [bold magenta]{args.negative_hidden_mode}[/bold magenta]")
 

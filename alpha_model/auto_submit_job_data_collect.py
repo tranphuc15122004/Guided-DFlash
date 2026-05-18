@@ -141,10 +141,27 @@ def _submit_job(env: dict) -> str:
 		["bash", str(LAUNCHER)],
 		cwd=str(ROOT_DIR),
 		env=env,
-		check=True,
 		text=True,
 		capture_output=True,
 	)
+
+	if result.returncode != 0:
+		# Print whatever output the launcher produced.
+		if result.stdout:
+			print(result.stdout, end="")
+		if result.stderr:
+			print(result.stderr, end="", file=sys.stderr)
+
+		err_msg = (result.stderr or result.stdout or "").strip()
+		raise RuntimeError(
+			f"Launcher exited with code {result.returncode}.\n"
+			f"{err_msg}"
+		)
+
+	if result.stdout:
+		print(result.stdout, end="")
+	if result.stderr:
+		print(result.stderr, end="", file=sys.stderr)
 
 	job_id = None
 	for line in (result.stdout + "\n" + result.stderr).splitlines():
@@ -159,9 +176,6 @@ def _submit_job(env: dict) -> str:
 			f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
 		)
 
-	print(result.stdout, end="")
-	if result.stderr:
-		print(result.stderr, end="", file=sys.stderr)
 	return job_id
 
 
@@ -195,12 +209,7 @@ def _ceil_div(a: int, b: int) -> int:
 def main() -> int:
 	args = _parse_args()
 	start_step = args.start_step or args.instance_per_job
-
-	# Thay đổi trong _build_env()
-	if args.project is not None:
-		env["PROJECT"] = args.project
-	else:
-		env.pop("PROJECT", None)  # ← Xóa PROJECT nếu có
+	overall_exit = 0
 
 	current_start = args.start_index
 	for dataset in args.datasets:
@@ -217,21 +226,29 @@ def main() -> int:
 				f"num_instances={this_job_instances} (job {job_num+1}/{num_jobs})"
 			)
 			env = _build_env(dataset, current_start, this_job_instances, args)
-			job_id = _submit_job(env)
-			print(f"[SUBMITTED] {job_id}")
+			try:
+				job_id = _submit_job(env)
+				print(f"[SUBMITTED] {job_id}")
+				time.sleep(1)
 
-			if not args.no_wait:
-				_wait_for_job(job_id, args.poll_seconds)
+				if not args.no_wait:
+					_wait_for_job(job_id, args.poll_seconds)
 
-			current_start += this_job_instances
-			remaining -= this_job_instances
-			job_num += 1
+				current_start += this_job_instances
+				remaining -= this_job_instances
+				job_num += 1
+			except RuntimeError as exc:
+				print(f"[FAIL] {exc}", file=sys.stderr)
+				overall_exit = 1
+				# If a job fails to submit, skip remaining jobs for this dataset
+				# (they will likely hit the same limit) and move to the next dataset.
+				break
 
 		# Reset the slice start for the next dataset unless the user is
 		# intentionally sweeping a single contiguous index range.
 		current_start = args.start_index
 
-	return 0
+	return overall_exit
 
 
 if __name__ == "__main__":

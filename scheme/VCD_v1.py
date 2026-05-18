@@ -13,6 +13,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, apply_vcd_logits, sample, load_and_process_dataset, extract_context_feature
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 """ 
 contrastive decoding with VCD candidate filtering 
@@ -307,6 +308,7 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    log_run_parameters("VCD_v1", args)
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 

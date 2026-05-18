@@ -13,8 +13,10 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
+    log_run_parameters("CD_v2_soften", args)
 TOP64_MASK_MODE = False 
 
 """ 

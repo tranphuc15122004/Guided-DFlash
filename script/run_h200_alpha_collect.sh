@@ -46,8 +46,9 @@ echo "Submitting H200 alpha collection job with settings:"
 echo "  dataset=$DATASET max_new_tokens=$MAX_NEW_TOKENS"
 echo "  output_dir=$COLLECTOR_OUTPUT_DIR"
 
-JOB_ID="$({
-qsub <<EOF
+# Use a temporary file to capture qsub output so we can handle errors gracefully.
+_qsub_stdout=$(mktemp)
+if qsub <<EOF > "$_qsub_stdout" 2>&1
 #!/bin/bash
 #PBS -P ${PROJECT}
 #PBS -q ${QUEUE}
@@ -109,12 +110,19 @@ python -m alpha_model.data_collecting \
   --max-new-tokens "${MAX_NEW_TOKENS}" \
   --start-index "${START_INDEX}" \
   --num-instances "${NUM_INSTANCES}" \
-  --seed "${SEED}" \
+  --seed "${SEED}"
 
 echo "[INFO] Collection completed. output_dir=${COLLECTOR_OUTPUT_DIR}"
 EOF
-} | tr -d '[:space:]')"
-
-echo "Submitted job: $JOB_ID"
-echo "Monitor: qstat -u ${USER}"
-echo "Tail log: tail -f logs/h200_alpha_collect_${JOB_ID}.log"
+then
+  JOB_ID="$(< "$_qsub_stdout" tr -d '[:space:]')"
+  rm -f "$_qsub_stdout"
+  echo "Submitted job: $JOB_ID"
+  echo "Monitor: qstat -u ${USER}"
+  echo "Tail log: tail -f logs/h200_alpha_collect_${JOB_ID}.log"
+else
+  _qsub_stderr="$(< "$_qsub_stdout")"
+  rm -f "$_qsub_stdout"
+  echo "[ERROR] qsub failed: $_qsub_stderr" >&2
+  exit 1
+fi

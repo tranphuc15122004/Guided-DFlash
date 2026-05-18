@@ -15,8 +15,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 from alpha_model import ContextualBanditAlpha, ContextualBanditAlpha_Dense
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
+    log_run_parameters("CD_alpha_model", args)
 TOP64_MASK_MODE = False 
 
 

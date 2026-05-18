@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from collections import Counter
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
@@ -279,6 +280,269 @@ def _write_report_md(
     )
 
 
+def _describe_distribution(values: np.ndarray) -> dict[str, Any]:
+    if values.size == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p10": 0.0,
+            "median": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        }
+
+    return {
+        "count": int(values.size),
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "min": float(values.min()),
+        "p10": float(np.quantile(values, 0.10)),
+        "median": float(np.quantile(values, 0.50)),
+        "p90": float(np.quantile(values, 0.90)),
+        "max": float(values.max()),
+    }
+
+
+def _build_ar_target_rank_record(
+    *,
+    sample_idx: int,
+    turn_idx: int,
+    decode_step: int,
+    block_start_position: int,
+    block_position: int,
+    acceptance_length: int,
+    token_source: str,
+    target_token_id: int,
+    positive_step_logits: torch.Tensor,
+    tokenizer: AutoTokenizer,
+) -> dict[str, Any]:
+    target_stats = _compute_target_token_stats(positive_step_logits, target_token_id)
+    return {
+        "sample_idx": int(sample_idx),
+        "turn_idx": int(turn_idx),
+        "decode_step": int(decode_step),
+        "block_start_position": int(block_start_position),
+        "absolute_position": int(block_start_position + block_position),
+        "block_position": int(block_position),
+        "acceptance_length": int(acceptance_length),
+        "token_source": token_source,
+        "target_token_id": int(target_token_id),
+        "target_token_text": _token_str(tokenizer, target_token_id),
+        "positive_target_rank": int(target_stats["rank"]),
+        "positive_target_logprob": float(target_stats["logprob"]),
+        "positive_top1_hit": int(target_stats["top1_hit"]),
+        "positive_top5_hit": int(target_stats["top5_hit"]),
+        "positive_top10_hit": int(target_stats["top10_hit"]),
+        "is_after_acceptance_length": int(block_position > acceptance_length),
+    }
+
+
+def _build_ar_target_rank_summary(
+    records: list[dict[str, Any]],
+    *,
+    dataset: str,
+    seed: int,
+    block_size: int,
+    cd_alpha: float,
+    cd_beta: float,
+    negative_context_dropout: float,
+    negative_context_noise_std: float,
+    negative_hidden_mode: str,
+    top64_mask_mode: bool,
+    final_override_keep: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not records:
+        summary = {
+            "meta": {
+                "dataset": dataset,
+                "seed": int(seed),
+                "block_size": int(block_size),
+                "target_token_definition": "ar_token_after_acceptance_length",
+                "cd_alpha": float(cd_alpha),
+                "cd_beta": float(cd_beta),
+                "negative_context_dropout": float(negative_context_dropout),
+                "negative_context_noise_std": float(negative_context_noise_std),
+                "negative_hidden_mode": negative_hidden_mode,
+                "top64_mask_mode": bool(top64_mask_mode),
+                "final_override_keep": int(final_override_keep),
+            },
+            "num_records": 0,
+            "num_blocks": 0,
+            "token_source_counts": {},
+            "token_source_rates": {},
+            "acceptance_length_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
+            "rank_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
+            "logprob_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
+            "topk_hit_rates": {"top1": 0.0, "top5": 0.0, "top10": 0.0},
+            "block_position_profile": [],
+        }
+        return summary, []
+
+    block_acceptance_lengths: dict[tuple[int, int, int, int], int] = {}
+    for row in records:
+        block_key = (
+            int(row["sample_idx"]),
+            int(row["turn_idx"]),
+            int(row["decode_step"]),
+            int(row["block_start_position"]),
+        )
+        block_acceptance_lengths.setdefault(block_key, int(row["acceptance_length"]))
+
+    acceptance_lengths = np.asarray(list(block_acceptance_lengths.values()), dtype=np.float64)
+    rank_values = np.asarray([row["positive_target_rank"] for row in records], dtype=np.float64)
+    logprob_values = np.asarray([row["positive_target_logprob"] for row in records], dtype=np.float64)
+    top1_values = np.asarray([row["positive_top1_hit"] for row in records], dtype=np.float64)
+    top5_values = np.asarray([row["positive_top5_hit"] for row in records], dtype=np.float64)
+    top10_values = np.asarray([row["positive_top10_hit"] for row in records], dtype=np.float64)
+    token_source_counts = Counter(row.get("token_source", "unknown") for row in records)
+
+    position_rows: list[dict[str, Any]] = []
+    for block_position in sorted({int(row["block_position"]) for row in records}):
+        subset = [row for row in records if int(row["block_position"]) == block_position]
+        source_counts = Counter(row.get("token_source", "unknown") for row in subset)
+        ranks = np.asarray([row["positive_target_rank"] for row in subset], dtype=np.float64)
+        logprobs = np.asarray([row["positive_target_logprob"] for row in subset], dtype=np.float64)
+        top1 = np.asarray([row["positive_top1_hit"] for row in subset], dtype=np.float64)
+        top5 = np.asarray([row["positive_top5_hit"] for row in subset], dtype=np.float64)
+        top10 = np.asarray([row["positive_top10_hit"] for row in subset], dtype=np.float64)
+
+        count = max(1, len(subset))
+        position_rows.append(
+            {
+                "block_position": int(block_position),
+                "count": int(len(subset)),
+                "verify_count": int(source_counts.get("verify", 0)),
+                "ar_suffix_count": int(source_counts.get("ar_suffix", 0)),
+                "verify_rate": float(source_counts.get("verify", 0) / count),
+                "ar_suffix_rate": float(source_counts.get("ar_suffix", 0) / count),
+                "rank_count": int(ranks.size),
+                "rank_mean": float(ranks.mean()) if ranks.size else 0.0,
+                "rank_std": float(ranks.std()) if ranks.size else 0.0,
+                "rank_min": float(ranks.min()) if ranks.size else 0.0,
+                "rank_p10": float(np.quantile(ranks, 0.10)) if ranks.size else 0.0,
+                "rank_median": float(np.quantile(ranks, 0.50)) if ranks.size else 0.0,
+                "rank_p90": float(np.quantile(ranks, 0.90)) if ranks.size else 0.0,
+                "rank_max": float(ranks.max()) if ranks.size else 0.0,
+                "logprob_mean": float(logprobs.mean()) if logprobs.size else 0.0,
+                "logprob_std": float(logprobs.std()) if logprobs.size else 0.0,
+                "logprob_min": float(logprobs.min()) if logprobs.size else 0.0,
+                "logprob_p10": float(np.quantile(logprobs, 0.10)) if logprobs.size else 0.0,
+                "logprob_median": float(np.quantile(logprobs, 0.50)) if logprobs.size else 0.0,
+                "logprob_p90": float(np.quantile(logprobs, 0.90)) if logprobs.size else 0.0,
+                "logprob_max": float(logprobs.max()) if logprobs.size else 0.0,
+                "top1_rate": float(top1.mean()) if top1.size else 0.0,
+                "top5_rate": float(top5.mean()) if top5.size else 0.0,
+                "top10_rate": float(top10.mean()) if top10.size else 0.0,
+            }
+        )
+
+    summary = {
+        "meta": {
+            "dataset": dataset,
+            "seed": int(seed),
+            "block_size": int(block_size),
+            "target_token_definition": "ar_token_after_acceptance_length",
+            "cd_alpha": float(cd_alpha),
+            "cd_beta": float(cd_beta),
+            "negative_context_dropout": float(negative_context_dropout),
+            "negative_context_noise_std": float(negative_context_noise_std),
+            "negative_hidden_mode": negative_hidden_mode,
+            "top64_mask_mode": bool(top64_mask_mode),
+            "final_override_keep": int(final_override_keep),
+        },
+        "num_records": int(len(records)),
+        "num_blocks": int(len(block_acceptance_lengths)),
+        "token_source_counts": {str(k): int(v) for k, v in token_source_counts.items()},
+        "token_source_rates": {
+            str(k): float(v / max(1, len(records))) for k, v in token_source_counts.items()
+        },
+        "acceptance_length_distribution": _describe_distribution(acceptance_lengths),
+        "rank_distribution": _describe_distribution(rank_values),
+        "logprob_distribution": _describe_distribution(logprob_values),
+        "topk_hit_rates": {
+            "top1": float(top1_values.mean()) if top1_values.size else 0.0,
+            "top5": float(top5_values.mean()) if top5_values.size else 0.0,
+            "top10": float(top10_values.mean()) if top10_values.size else 0.0,
+        },
+        "block_position_profile": position_rows,
+    }
+
+    return summary, position_rows
+
+
+def _write_ar_target_rank_report_md(
+    report_path: Path,
+    summary: dict[str, Any],
+    max_rows: int,
+) -> None:
+    lines: list[str] = []
+    lines.append("# AR Target Token Rank Survey")
+    lines.append("")
+
+    meta = summary.get("meta", {})
+    lines.append("## Setup")
+    lines.append(f"- Dataset: **{meta.get('dataset', '')}**")
+    lines.append(f"- Seed: **{meta.get('seed', 0)}**")
+    lines.append(f"- Block size: **{meta.get('block_size', 0)}**")
+    lines.append(f"- Target token definition: **{meta.get('target_token_definition', '')}**")
+    lines.append(f"- CD alpha / beta: **{meta.get('cd_alpha', 0.0):.4f} / {meta.get('cd_beta', 0.0):.4f}**")
+    lines.append(
+        f"- Negative context dropout / noise: **{meta.get('negative_context_dropout', 0.0):.2f} / {meta.get('negative_context_noise_std', 0.0):.2f}**"
+    )
+    lines.append(f"- Negative hidden mode: **{meta.get('negative_hidden_mode', '')}**")
+    lines.append("")
+
+    lines.append("## Overall")
+    lines.append(f"- Records: **{summary.get('num_records', 0)}**")
+    lines.append(f"- Blocks: **{summary.get('num_blocks', 0)}**")
+    lines.append(f"- Acceptance length mean: **{summary.get('acceptance_length_distribution', {}).get('mean', 0.0):.2f}**")
+    lines.append(f"- Positive rank mean: **{summary.get('rank_distribution', {}).get('mean', 0.0):.2f}**")
+    lines.append(f"- Positive rank median: **{summary.get('rank_distribution', {}).get('median', 0.0):.2f}**")
+    lines.append(
+        f"- Top-1 / Top-5 / Top-10: **{summary.get('topk_hit_rates', {}).get('top1', 0.0) * 100:.2f}% / {summary.get('topk_hit_rates', {}).get('top5', 0.0) * 100:.2f}% / {summary.get('topk_hit_rates', {}).get('top10', 0.0) * 100:.2f}%**"
+    )
+    source_counts = summary.get("token_source_counts", {})
+    lines.append(
+        f"- Token source counts: verify **{source_counts.get('verify', 0)}**, ar_suffix **{source_counts.get('ar_suffix', 0)}**"
+    )
+    lines.append("")
+
+    lines.append("## Per-Position Summary")
+    lines.append("| pos | count | verify | ar_suffix | verify_rate | rank_mean | rank_median | logprob_mean | top1 | top5 | top10 |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    rows = summary.get("block_position_profile", [])
+    for row in rows[:max_rows]:
+        lines.append(
+            "| "
+            f"{row.get('block_position', 0)} | "
+            f"{row.get('count', 0)} | "
+            f"{row.get('verify_count', 0)} | "
+            f"{row.get('ar_suffix_count', 0)} | "
+            f"{row.get('verify_rate', 0.0) * 100:.2f}% | "
+            f"{row.get('rank_mean', 0.0):.2f} | "
+            f"{row.get('rank_median', 0.0):.2f} | "
+            f"{row.get('logprob_mean', 0.0):.4f} | "
+            f"{row.get('top1_rate', 0.0) * 100:.2f}% | "
+            f"{row.get('top5_rate', 0.0) * 100:.2f}% | "
+            f"{row.get('top10_rate', 0.0) * 100:.2f}% |"
+        )
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def print_ar_target_rank_console_summary(summary: dict[str, Any]) -> None:
+    source_counts = summary.get("token_source_counts", {})
+    print(f"AR target-rank records: {summary.get('num_records', 0)}")
+    print(f"AR target-rank blocks: {summary.get('num_blocks', 0)}")
+    print(
+        f"Token source counts: verify {source_counts.get('verify', 0)}, ar_suffix {source_counts.get('ar_suffix', 0)}"
+    )
+    print(f"Acceptance length mean: {summary.get('acceptance_length_distribution', {}).get('mean', 0.0):.2f}")
+    print(f"Positive rank mean: {summary.get('rank_distribution', {}).get('mean', 0.0):.2f}")
+
+
 @torch.inference_mode()
 def dflash_generate(
     model: DFlashDraftModel,
@@ -297,6 +561,7 @@ def dflash_generate(
     negative_hidden_mode: str = "mask_zero",
     divergence_accumulator: Optional[List[float]] = None,
     reject_records: Optional[list[dict[str, Any]]] = None,
+    ar_rank_records: Optional[list[dict[str, Any]]] = None,
     cd_shadow_num_samples: int = 1,
     sample_idx: int = -1,
     turn_idx: int = -1,
@@ -372,8 +637,8 @@ def dflash_generate(
             final_draft_logits = apply_cd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
 
             # Match CDv2 rollout behavior by overriding early positions with positive logits.
-            n_keep = min(FINAL_OVERRIDE_KEEP, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :]
+            """ n_keep = min(FINAL_OVERRIDE_KEEP, final_draft_logits.size(1))
+            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
 
             block_output_ids[:, 1:] = sample(final_draft_logits, gen=gen)
             cd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)
@@ -391,6 +656,65 @@ def dflash_generate(
 
         posterior = sample(output.logits, temperature, gen=gen)
         acceptance_length = int((block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item())
+
+        block_start = start
+        committed_block_ids = block_output_ids.clone()
+        committed_hidden_chunks: list[torch.Tensor] = []
+        if block_size > 1:
+            committed_hidden_chunks.append(
+                extract_context_feature(output.hidden_states, model.target_layer_ids)[:, : acceptance_length + 1, :]
+            )
+
+        seed_token = posterior[:, acceptance_length : acceptance_length + 1]
+        if block_size > 1 and acceptance_length < (block_size - 1):
+            past_key_values_target.crop(block_start + acceptance_length + 1)
+            next_token = seed_token
+            for block_position in range(acceptance_length + 1, block_size):
+                committed_block_ids[:, block_position] = next_token[:, 0]
+                ar_output = target(
+                    next_token,
+                    position_ids=position_ids[:, block_start + block_position : block_start + block_position + 1],
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                committed_hidden_chunks.append(
+                    extract_context_feature(ar_output.hidden_states, model.target_layer_ids)
+                )
+                next_token = sample(ar_output.logits, temperature, gen=gen)
+            seed_token = next_token
+
+        if block_size > 1:
+            target_hidden = torch.cat(committed_hidden_chunks, dim=1)
+
+        if ar_rank_records is not None and block_size > 1:
+            stop_token_set = set(stop_token_ids or [])
+            max_record_position = block_size - 1
+            if stop_token_set:
+                for block_position in range(1, block_size):
+                    token_id = int(committed_block_ids[0, block_position].item())
+                    if token_id in stop_token_set:
+                        max_record_position = block_position
+                        break
+
+            for block_position in range(1, max_record_position + 1):
+                token_source = "verify" if block_position <= acceptance_length else "ar_suffix"
+                target_token_id = int(committed_block_ids[0, block_position].item())
+                positive_step_logits = positive_draft_logits[0, block_position - 1, :].float()
+                ar_rank_records.append(
+                    _build_ar_target_rank_record(
+                        sample_idx=sample_idx,
+                        turn_idx=turn_idx,
+                        decode_step=decode_step,
+                        block_start_position=block_start,
+                        block_position=block_position,
+                        acceptance_length=acceptance_length,
+                        token_source=token_source,
+                        target_token_id=target_token_id,
+                        positive_step_logits=positive_step_logits,
+                        tokenizer=tokenizer,
+                    )
+                )
 
         if block_size > 1 and reject_records is not None and acceptance_length < (block_size - 1):
             reject_offset = acceptance_length
@@ -422,16 +746,14 @@ def dflash_generate(
                 )
             )
 
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+        output_ids[:, block_start : block_start + block_size] = committed_block_ids
+        output_ids[:, block_start + block_size] = seed_token[:, 0]
 
         acceptance_lengths.append(acceptance_length + 1)
-        start += acceptance_length + 1
+        start += block_size
         decode_step += 1
 
         past_key_values_target.crop(start)
-        if block_size > 1:
-            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, : acceptance_length + 1, :]
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -558,6 +880,7 @@ def main() -> None:
 
     divergence_accumulator: List[float] = []
     reject_records: list[dict[str, Any]] = []
+    ar_rank_records: list[dict[str, Any]] = []
     responses = []
 
     indices = range(dist.rank(), len(dataset), dist.size())
@@ -595,6 +918,7 @@ def main() -> None:
                     negative_hidden_mode=args.negative_hidden_mode,
                     divergence_accumulator=divergence_accumulator if bs == block_size else None,
                     reject_records=reject_records if bs == block_size else None,
+                    ar_rank_records=ar_rank_records if bs == block_size else None,
                     cd_shadow_num_samples=args.cd_shadow_num_samples,
                     sample_idx=idx,
                     turn_idx=turn_index,
@@ -610,10 +934,12 @@ def main() -> None:
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
         reject_records = dist.gather(reject_records, dst=0)
+        ar_rank_records = dist.gather(ar_rank_records, dst=0)
         if not dist.is_main():
             return
         responses = list(chain(*responses))
         reject_records = list(chain(*reject_records))
+        ar_rank_records = list(chain(*ar_rank_records))
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
@@ -677,6 +1003,44 @@ def main() -> None:
     print(f"  - {report_md_path.name}")
     if plot_files:
         print(f"  - plots: {', '.join(plot_files)}")
+
+    ar_summary, ar_by_position_rows = _build_ar_target_rank_summary(
+        ar_rank_records,
+        dataset=args.dataset,
+        seed=args.seed,
+        block_size=block_size,
+        cd_alpha=args.cd_alpha,
+        cd_beta=args.cd_beta,
+        negative_context_dropout=args.negative_context_dropout,
+        negative_context_noise_std=args.negative_context_noise_std,
+        negative_hidden_mode=args.negative_hidden_mode,
+        top64_mask_mode=bool(TOP64_MASK_MODE),
+        final_override_keep=int(FINAL_OVERRIDE_KEEP),
+    )
+
+    ar_jsonl_path = report_dir / "ar_target_rank_records.jsonl"
+    ar_csv_path = report_dir / "ar_target_rank_records.csv"
+    ar_summary_path = report_dir / "ar_target_rank_summary.json"
+    ar_by_position_path = report_dir / "ar_target_rank_by_position.csv"
+    ar_report_md_path = report_dir / "ar_target_rank_report.md"
+
+    _write_jsonl(ar_jsonl_path, ar_rank_records)
+    _write_csv(ar_csv_path, ar_rank_records)
+    ar_summary_path.write_text(json.dumps(ar_summary, indent=2), encoding="utf-8")
+    _write_csv(ar_by_position_path, ar_by_position_rows)
+    _write_ar_target_rank_report_md(
+        ar_report_md_path,
+        summary=ar_summary,
+        max_rows=args.max_example_rows,
+    )
+
+    print_ar_target_rank_console_summary(ar_summary)
+    print(f"AR target-rank artifacts: {report_dir}")
+    print(f"  - {ar_jsonl_path.name}")
+    print(f"  - {ar_csv_path.name}")
+    print(f"  - {ar_summary_path.name}")
+    print(f"  - {ar_by_position_path.name}")
+    print(f"  - {ar_report_md_path.name}")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, sample, load_and_process_dataset, extract_context_feature
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 
 
@@ -215,6 +216,7 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    log_run_parameters("mask_50_redraft", args)
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 

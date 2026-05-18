@@ -13,6 +13,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import DFlashDraftModel, apply_vcd_logits, sample, load_and_process_dataset, extract_context_feature
 import distributed as dist
+from scheme.run_metadata import log_run_parameters
 
 """ 
 Contrastive decoding with VCD candidate filtering and enhanced negative sampling for the draft model.
@@ -332,9 +333,9 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--vcd-alpha", type=float, default=1.0)
-    parser.add_argument("--vcd-beta", type=float, default=0.1)
-    parser.add_argument("--negative-context-dropout", type=float, default=0.3)
+    parser.add_argument("--vcd-alpha", type=float, default=0.5)
+    parser.add_argument("--vcd-beta", type=float, default=0.0)
+    parser.add_argument("--negative-context-dropout", type=float, default=1.0)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -344,6 +345,7 @@ def main() -> None:
         help="Enable fully deterministic behavior for reproducible runs.",
     )
     args = parser.parse_args()
+    log_run_parameters("VCD_v2", args)
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
