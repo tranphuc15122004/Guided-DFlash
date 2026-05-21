@@ -11,7 +11,6 @@ from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional
-
 import distributed as dist
 import numpy as np
 import torch
@@ -692,10 +691,6 @@ def dflash_generate(
                 alpha=cd_alpha,
             )
             final_draft_logits = apply_cd_candidate_filter(logits=final_draft_logits, candidate_mask=candidate_mask)
-
-            # Match CDv2 rollout behavior by overriding early positions with positive logits.
-            """ n_keep = min(FINAL_OVERRIDE_KEEP, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = positive_draft_logits[:, :n_keep, :] """
 
             block_output_ids[:, 1:] = sample(final_draft_logits, gen=gen)
             cd_shadow_sampled_tokens = sample(final_draft_logits, gen=gen)

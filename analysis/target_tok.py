@@ -1,8 +1,12 @@
 import argparse
+import csv
+import datetime
+import json
 import os
 import time
 import random
 from itertools import chain
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 from loguru import logger
@@ -13,15 +17,14 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from model import *
 import distributed as dist
+import model
 from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
 TOP64_MASK_MODE = False 
 
-
 def cuda_time() -> float:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -51,6 +54,12 @@ def build_negative_block_output_random(block_output_ids: torch.Tensor, vocab_siz
     batch_size = block_output_ids.shape[0]
     random_tokens = torch.randint(0, vocab_size, (batch_size,), device=block_output_ids.device , generator=gen)
     negative_block_output_ids[:, 0] = random_tokens
+    return negative_block_output_ids
+
+def build_negative_block_output_mask(block_output_ids: torch.Tensor, mask_token : int , vocab_size: int , gen : torch.Generator = None) -> torch.Tensor:
+    negative_block_output_ids = block_output_ids.clone()
+    batch_size = block_output_ids.shape[0]
+    negative_block_output_ids[:, 0] = mask_token
     return negative_block_output_ids
 
 def build_negative_target_hidden(
@@ -106,6 +115,7 @@ def compute_contrastive_draft_logits(
     draft_position_ids: torch.Tensor,
     past_key_values_draft: DynamicCache,
     block_size: int,
+    mask_token : int,
     negative_context_dropout: float,
     negative_context_noise_std: float,
     negative_hidden_mode: str,
@@ -114,6 +124,8 @@ def compute_contrastive_draft_logits(
     batch_size = block_output_ids.shape[0]
     
     neg_block_output_ids = build_negative_block_output_random(block_output_ids, target.config.vocab_size , gen)
+    #neg_block_output_ids = build_negative_block_output_mask (block_output_ids , mask_token , target.config.vocab_size , gen)
+    
     negative_target_hidden = build_negative_target_hidden(
         target_hidden=target_hidden,
         dropout_ratio=negative_context_dropout,
@@ -181,38 +193,6 @@ def apply_cd_candidate_filter(
     )
     return filtered_logits
 
-
-def soften_logits_for_contrastive(
-    logits: torch.Tensor,
-    temperature: float,
-    uniform_mix: float,
-    min_prob: float = 1e-8,
-) -> torch.Tensor:
-    """
-    Soften token distribution before contrastive decoding.
-
-    - temperature > 1.0 flattens distribution
-    - uniform_mix blends with uniform prior to avoid over-confident peaks
-    """
-    if temperature <= 0.0:
-        raise ValueError(f"temperature must be > 0, got {temperature}")
-    if not (0.0 <= uniform_mix < 1.0):
-        raise ValueError(f"uniform_mix must be in [0, 1), got {uniform_mix}")
-    if not (0.0 < min_prob < 1.0):
-        raise ValueError(f"min_prob must be in (0, 1), got {min_prob}")
-
-    scaled_logits = logits.float() / temperature
-    probs = torch.softmax(scaled_logits, dim=-1)
-
-    if uniform_mix > 0.0:
-        vocab_size = probs.size(-1)
-        uniform_prob = 1.0 / float(vocab_size)
-        probs = (1.0 - uniform_mix) * probs + uniform_mix * uniform_prob
-
-    probs = probs.clamp_min(min_prob)
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-    return torch.log(probs)
-
 def _compute_kl_divergence(
     first_logits: torch.Tensor,
     second_logits: torch.Tensor,
@@ -252,6 +232,9 @@ def log_logits_difference(
         f"L2 distance: {l2_dist.item():.4f}"
     )
 
+
+# =============================================================================
+
 @torch.inference_mode()
 def dflash_generate(
     model: DFlashDraftModel,
@@ -268,12 +251,9 @@ def dflash_generate(
     negative_context_noise_std: float = 0.0,
     negative_hidden_mode: str = "mask_zero",
     divergence_accumulator: Optional[List[float]] = None,
-    cdv2_soften: bool = True,
-    cdv2_soften_temperature: float = 1.25,
-    cdv2_soften_uniform_mix: float = 0.03,
-    cdv2_soften_min_prob: float = 1e-8,
-    cdv2_candidate_mask_source: str = "softened",
-    cdv2_nkeep_source: str = "softened",
+    output_ids_collector: Optional[List[torch.Tensor]] = None,
+    ar_target_tok_prediction_collector: Optional[List[torch.Tensor]] = None,
+    block_analysis_collector: Optional[List[dict]] = None,
     seed: int = 0,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
@@ -315,6 +295,7 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
+    
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -329,62 +310,33 @@ def dflash_generate(
                 draft_position_ids=draft_position_ids,
                 past_key_values_draft=past_key_values_draft,
                 block_size=block_size,
+                mask_token = mask_token_id,
                 negative_context_dropout=negative_context_dropout,
                 negative_context_noise_std=negative_context_noise_std,
                 negative_hidden_mode=negative_hidden_mode,
                 gen=gen
             )
             past_key_values_draft.crop(start)
-
-            raw_positive_draft_logits = positive_draft_logits
-            raw_negative_draft_logits = negative_draft_logits
-
-            positive_logits_for_cd = raw_positive_draft_logits.float()
-            negative_logits_for_cd = raw_negative_draft_logits.float()
-
-            if cdv2_soften:
-                positive_logits_for_cd = soften_logits_for_contrastive(
-                    logits=positive_logits_for_cd,
-                    temperature=cdv2_soften_temperature,
-                    uniform_mix=cdv2_soften_uniform_mix,
-                    min_prob=cdv2_soften_min_prob,
-                )
-                negative_logits_for_cd = soften_logits_for_contrastive(
-                    logits=negative_logits_for_cd,
-                    temperature=cdv2_soften_temperature,
-                    uniform_mix=cdv2_soften_uniform_mix,
-                    min_prob=cdv2_soften_min_prob,
-                )
-
-            if cdv2_soften and cdv2_candidate_mask_source == "softened":
-                candidate_reference_logits = positive_logits_for_cd
-            else:
-                candidate_reference_logits = raw_positive_draft_logits
-
-            if cdv2_soften and cdv2_nkeep_source == "softened":
-                nkeep_reference_logits = positive_logits_for_cd
-            else:
-                nkeep_reference_logits = raw_positive_draft_logits
             
             # ----- Divergence witness (optional) -----
             if divergence_accumulator is not None:
-                kl_val = _compute_kl_divergence(positive_logits_for_cd, negative_logits_for_cd)
+                kl_val = _compute_kl_divergence(positive_draft_logits, negative_draft_logits)
                 divergence_accumulator.append(kl_val)
 
             if not TOP64_MASK_MODE:
                 candidate_mask = build_cd_candidate_mask(
-                    reference_logits=candidate_reference_logits,
+                    reference_logits=positive_draft_logits,
                     beta=beta,
                 )
             else:
                 candidate_mask = build_topk_probability_mask(
-                    reference_logits=candidate_reference_logits,
+                    reference_logits=positive_draft_logits,
                     top_k=64,
                 )
-                        
+            
             final_draft_logits = apply_cd_logits(
-                first_logits=positive_logits_for_cd,
-                second_logits=negative_logits_for_cd,
+                first_logits=positive_draft_logits,
+                second_logits=negative_draft_logits,
                 alpha=cd_alpha,
             )
             
@@ -393,9 +345,6 @@ def dflash_generate(
                 candidate_mask=candidate_mask,
             )
             
-            # Applying positive draft logits to the top candidates in the final draft logits to further reduce the chance of selecting a token that is not favored by the positive draft
-            n_keep = min(6, final_draft_logits.size(1))
-            final_draft_logits[:, :n_keep, :] = nkeep_reference_logits[:, :n_keep, :]
             
             block_output_ids[:, 1:] = sample(final_draft_logits , gen=gen)
             if draft_prefill:
@@ -421,6 +370,103 @@ def dflash_generate(
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
         
+        
+        # Number of remaining positions after the bonus token to predict via AR
+        num_ar_steps = block_size - acceptance_length - 2
+
+        # AR target model prediction (non-intrusive: save/restore KV cache)
+        # Seed = bonus token (posterior[:, acceptance_length]) at current `start` position
+        ar_seed_tok = output_ids[:, start : start + 1]
+        ar_position_ids = position_ids[:, start : start + 1]
+        # Stacked tensor: row 0 = absolute positions, row 1 = predicted token IDs
+        # (2, block_size+1) — unfilled entries remain mask_token_id
+        ar_target_tok_pred_stacked = torch.full(
+            (2, block_size + 1),
+            mask_token_id,
+            dtype=torch.long,
+            device=model.device,
+        )
+        if block_size > 1 and num_ar_steps > 0:
+            # Save a snapshot of the current KV cache length
+            ar_cache_len = past_key_values_target.get_seq_length()
+            
+            for ar_step_idx in range(num_ar_steps):
+                abs_pos = start + 1 + ar_step_idx
+                ar_target_tok_pred_stacked[0, ar_step_idx] = abs_pos  # absolute position
+                ar_output = target(
+                    ar_seed_tok,
+                    position_ids=ar_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                )
+                ar_next_token = sample(ar_output.logits, temperature , gen=gen)
+                ar_target_tok_pred_stacked[1, ar_step_idx] = ar_next_token
+                ar_seed_tok = ar_next_token
+                ar_position_ids += 1
+            
+            # Restore cache to pre-AR state so speculative loop is unaffected
+            past_key_values_target.crop(ar_cache_len)
+        
+        if ar_target_tok_prediction_collector is not None:
+            ar_target_tok_prediction_collector.append(ar_target_tok_pred_stacked.cpu())
+            
+        
+        # Build full-block target reference:
+        #   [0]            = seeded token
+        #   [1..acc_len]   = accepted draft tokens
+        #   [acc_len+1]    = bonus token (posterior[:, acceptance_length])
+        #   [acc_len+2..]  = AR predictions (if num_ar_steps > 0)
+        tmp_target_tok_ids = torch.full((1, block_size), mask_token_id, dtype=torch.long, device=model.device)
+        tmp_target_tok_ids[:, : acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+        if acceptance_length + 1 < block_size:
+            tmp_target_tok_ids[:, acceptance_length + 1] = posterior[:, acceptance_length]  # bonus token
+        if num_ar_steps > 0:
+            tmp_target_tok_ids[:, acceptance_length + 2:] = ar_target_tok_pred_stacked[1, :num_ar_steps]
+        
+        
+        # ── Per-position analysis: target rank in positive & CD logits ──
+        if block_analysis_collector is not None and block_size > 1:
+            record = {
+                "block_start": int(start - acceptance_length - 1),
+                "acceptance_length": int(acceptance_length),
+                "num_ar_steps": int(max(0, num_ar_steps)),
+            }
+            for p in range(1, block_size):
+                target_id = int(tmp_target_tok_ids[0, p].item())
+                if target_id == mask_token_id:
+                    continue
+                draft_id = int(block_output_ids[0, p].item())
+                pos_logits_1d = positive_draft_logits[0, p-1, :].float()
+                cd_logits_1d  = final_draft_logits[0, p-1, :].float()
+                
+                pos_rank = int((pos_logits_1d > pos_logits_1d[target_id]).sum().item()) + 1
+                cd_rank  = int((cd_logits_1d  > cd_logits_1d[target_id]).sum().item()) + 1
+                pos_logprob = float(torch.log_softmax(pos_logits_1d, dim=-1)[target_id].item())
+                cd_logprob  = float(torch.log_softmax(cd_logits_1d, dim=-1)[target_id].item())
+                pos_probs = torch.softmax(pos_logits_1d, dim=-1)
+                entropy = float(-(pos_probs * torch.log(pos_probs + 1e-10)).sum().item())
+                
+                if p <= acceptance_length:
+                    cohort = "verify"
+                elif p == acceptance_length + 1:
+                    cohort = "bonus"
+                else:
+                    cohort = "ar_suffix"
+                
+                record[f"p{p}_cohort"] = cohort
+                record[f"p{p}_target_id"] = target_id
+                record[f"p{p}_draft_id"] = draft_id
+                record[f"p{p}_draft_matches_target"] = int(draft_id == target_id)
+                record[f"p{p}_pos_rank"] = pos_rank
+                record[f"p{p}_cd_rank"] = cd_rank
+                record[f"p{p}_pos_logprob"] = pos_logprob
+                record[f"p{p}_cd_logprob"] = cd_logprob
+                record[f"p{p}_entropy"] = entropy
+            block_analysis_collector.append(record)
+        
+        
+        past_key_values_target.crop(start)
+        # Check if we've hit a stop token in the accepted output
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
         ):
@@ -433,6 +479,9 @@ def dflash_generate(
         stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
         if stop_token_indices.numel() > 0:
             output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+
+    if output_ids_collector is not None:
+        output_ids_collector.append(output_ids.cpu())
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
@@ -458,47 +507,9 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", type=float, default=0.05)
+    parser.add_argument("--cd-alpha", type=float, default=0.1)
     parser.add_argument("--cd-beta", type=float, default=0.0)
-    parser.add_argument(
-        "--cdv2-soften",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable probability softening before applying contrastive logits.",
-    )
-    parser.add_argument(
-        "--cdv2-soften-temperature",
-        type=float,
-        default=1.25,
-        help="Temperature for pre-contrastive softening; >1.0 flattens distribution.",
-    )
-    parser.add_argument(
-        "--cdv2-soften-uniform-mix",
-        type=float,
-        default=0.03,
-        help="Blend ratio with uniform prior for pre-contrastive softening.",
-    )
-    parser.add_argument(
-        "--cdv2-soften-min-prob",
-        type=float,
-        default=1e-8,
-        help="Numerical floor for probabilities during softening.",
-    )
-    parser.add_argument(
-        "--cdv2-candidate-mask-source",
-        type=str,
-        choices=["softened", "raw"],
-        default="softened",
-        help="Which logits to use for candidate-mask construction.",
-    )
-    parser.add_argument(
-        "--cdv2-nkeep-source",
-        type=str,
-        choices=["softened", "raw"],
-        default="softened",
-        help="Which logits to keep for first n_keep positions after contrastive combination.",
-    )
-    parser.add_argument("--negative-context-dropout", type=float, default=0.3)
+    parser.add_argument("--negative-context-dropout", type=float, default=1.0)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
     parser.add_argument(
         "--negative-hidden-mode",
@@ -514,25 +525,13 @@ def main() -> None:
         default=True,
         help="Enable fully deterministic behavior for reproducible runs.",
     )
+    parser.add_argument(
+        "--output-dir", type=str, default="./analysis/results", help="Directory to save outputs and logs."
+    )
     args = parser.parse_args()
-
-    if args.cdv2_soften_temperature <= 0.0:
-        raise ValueError(f"--cdv2-soften-temperature must be > 0, got {args.cdv2_soften_temperature}")
-    if not (0.0 <= args.cdv2_soften_uniform_mix < 1.0):
-        raise ValueError(f"--cdv2-soften-uniform-mix must be in [0, 1), got {args.cdv2_soften_uniform_mix}")
-    if not (0.0 < args.cdv2_soften_min_prob < 1.0):
-        raise ValueError(f"--cdv2-soften-min-prob must be in (0, 1), got {args.cdv2_soften_min_prob}")
-
+    log_run_parameters("CD_v2", args)
     NEGATIVE_HIDDEN_MODE = args.negative_hidden_mode
     print(f"Using negative hidden mode: [bold magenta]{args.negative_hidden_mode}[/bold magenta]")
-    print(
-        "CDv2 soften config: "
-        f"[bold cyan]enabled={args.cdv2_soften}, "
-        f"temperature={args.cdv2_soften_temperature}, "
-        f"uniform_mix={args.cdv2_soften_uniform_mix}, "
-        f"mask_source={args.cdv2_candidate_mask_source}, "
-        f"nkeep_source={args.cdv2_nkeep_source}[/bold cyan]"
-    )
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -583,6 +582,9 @@ def main() -> None:
         dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
     divergence_accumulator: List[float] = [] 
+    output_ids_collector: List[torch.Tensor] = []
+    target_tok_prediction_collector: List[torch.Tensor] = []
+    block_analysis_collector: List[dict] = []
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
@@ -610,16 +612,13 @@ def main() -> None:
                     temperature=args.temperature,
                     cd_alpha=args.cd_alpha,
                     beta=args.cd_beta,
-                    cdv2_soften=args.cdv2_soften,
-                    cdv2_soften_temperature=args.cdv2_soften_temperature,
-                    cdv2_soften_uniform_mix=args.cdv2_soften_uniform_mix,
-                    cdv2_soften_min_prob=args.cdv2_soften_min_prob,
-                    cdv2_candidate_mask_source=args.cdv2_candidate_mask_source,
-                    cdv2_nkeep_source=args.cdv2_nkeep_source,
                     negative_context_dropout=args.negative_context_dropout,
                     negative_context_noise_std=args.negative_context_noise_std,
                     negative_hidden_mode=args.negative_hidden_mode,
                     divergence_accumulator = divergence_accumulator,
+                    output_ids_collector = output_ids_collector,
+                    ar_target_tok_prediction_collector = target_tok_prediction_collector,
+                    block_analysis_collector = block_analysis_collector,
                     seed = sample_seed + bs,
                 )
             
@@ -652,6 +651,187 @@ def main() -> None:
         print(f"Average KL divergence between draft logits: {avg_divergence:.5f}")
         # Optionally also show min/max for a quick sense of spread
         print(f"  Min KL: {min(divergence_accumulator):.5f}   Max KL: {max(divergence_accumulator):.5f}")
+    
+    # save the collected output ids for further analysis
+    output_dir = Path(args.output_dir) / f'target_tok_{args.dataset}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    os.makedirs(output_dir, exist_ok=True)
+    if output_ids_collector:
+        output_path = output_dir / "collected_output_ids.pt"
+        torch.save(output_ids_collector, output_path)
+        print(f"Collected output IDs saved to: {output_path}")
+    
+    if target_tok_prediction_collector:
+        target_tok_output_path = output_dir / "collected_target_tok_predictions.pt"
+        torch.save(target_tok_prediction_collector, target_tok_output_path)
+        print(f"Collected target token predictions saved to: {target_tok_output_path}")
+    
+    # ── Block analysis post-processing ──
+    if block_analysis_collector:
+        # Flatten per-position records into rows
+        flat_rows: list[dict] = []
+        for rec in block_analysis_collector:
+            for p in range(1, block_size):
+                key = f"p{p}_cohort"
+                if key not in rec:
+                    continue
+                row = {
+                    "block_start": rec.get("block_start", 0),
+                    "acceptance_length": rec.get("acceptance_length", 0),
+                    "block_position": p,
+                    "cohort": rec[key],
+                    "target_id": rec.get(f"p{p}_target_id", -1),
+                    "draft_id": rec.get(f"p{p}_draft_id", -1),
+                    "draft_matches_target": rec.get(f"p{p}_draft_matches_target", 0),
+                    "pos_rank": rec.get(f"p{p}_pos_rank", -1),
+                    "cd_rank": rec.get(f"p{p}_cd_rank", -1),
+                    "pos_logprob": rec.get(f"p{p}_pos_logprob", 0.0),
+                    "cd_logprob": rec.get(f"p{p}_cd_logprob", 0.0),
+                    "entropy": rec.get(f"p{p}_entropy", 0.0),
+                }
+                row["delta_rank"] = row["pos_rank"] - row["cd_rank"]  # >0 = CD improves
+                row["delta_logprob"] = row["cd_logprob"] - row["pos_logprob"]
+                flat_rows.append(row)
+        
+        # Write JSONL
+        analysis_jsonl = output_dir / "block_analysis.jsonl"
+        with open(analysis_jsonl, "w") as f:
+            for row in flat_rows:
+                f.write(json.dumps(row) + "\n")
+        
+        # Build per-position and per-cohort summaries
+        pos_summary_rows: list[dict] = []
+        for pos in sorted(set(r["block_position"] for r in flat_rows)):
+            subset = [r for r in flat_rows if r["block_position"] == pos]
+            ranks = np.array([r["pos_rank"] for r in subset], dtype=float)
+            cd_ranks = np.array([r["cd_rank"] for r in subset], dtype=float)
+            deltas = np.array([r["delta_rank"] for r in subset], dtype=float)
+            match_rate = np.mean([r["draft_matches_target"] for r in subset])
+            cohort = subset[0]["cohort"]
+            pos_summary_rows.append({
+                "block_position": pos,
+                "cohort": cohort,
+                "count": len(subset),
+                "pos_rank_mean": float(ranks.mean()),
+                "pos_rank_median": float(np.median(ranks)),
+                "cd_rank_mean": float(cd_ranks.mean()),
+                "delta_rank_mean": float(deltas.mean()),
+                "draft_match_rate": float(match_rate),
+                "top1_rate": float((ranks == 1).mean()),
+                "cd_top1_rate": float((cd_ranks == 1).mean()),
+            })
+        
+        cohort_summary_rows: list[dict] = []
+        for cohort in ["verify", "bonus", "ar_suffix"]:
+            subset = [r for r in flat_rows if r["cohort"] == cohort]
+            if not subset:
+                continue
+            ranks = np.array([r["pos_rank"] for r in subset], dtype=float)
+            cd_ranks = np.array([r["cd_rank"] for r in subset], dtype=float)
+            deltas = np.array([r["delta_rank"] for r in subset], dtype=float)
+            logprobs = np.array([r["pos_logprob"] for r in subset], dtype=float)
+            entropies = np.array([r["entropy"] for r in subset], dtype=float)
+            cohort_summary_rows.append({
+                "cohort": cohort,
+                "count": len(subset),
+                "pos_rank_mean": float(ranks.mean()),
+                "pos_rank_median": float(np.median(ranks)),
+                "cd_rank_mean": float(cd_ranks.mean()),
+                "delta_rank_mean": float(deltas.mean()),
+                "pos_logprob_mean": float(logprobs.mean()),
+                "entropy_mean": float(entropies.mean()),
+                "top1_rate": float((ranks == 1).mean()),
+                "top5_rate": float((ranks <= 5).mean()),
+                "cd_top1_rate": float((cd_ranks == 1).mean()),
+                "cd_top5_rate": float((cd_ranks <= 5).mean()),
+                "draft_match_rate": float(np.mean([r["draft_matches_target"] for r in subset])),
+            })
+        
+        # Write CSV
+        analysis_csv = output_dir / "block_analysis.csv"
+        if flat_rows:
+            fieldnames = list(flat_rows[0].keys())
+            with open(analysis_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(flat_rows)
+        
+        pos_csv = output_dir / "block_analysis_by_position.csv"
+        if pos_summary_rows:
+            fieldnames = list(pos_summary_rows[0].keys())
+            with open(pos_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(pos_summary_rows)
+        
+        cohort_csv = output_dir / "block_analysis_by_cohort.csv"
+        if cohort_summary_rows:
+            fieldnames = list(cohort_summary_rows[0].keys())
+            with open(cohort_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(cohort_summary_rows)
+        
+        # Build summary dict
+        summary_data = {
+            "meta": {
+                "dataset": args.dataset,
+                "seed": args.seed,
+                "block_size": block_size,
+            },
+            "num_blocks": len(block_analysis_collector),
+            "num_position_records": len(flat_rows),
+            "cohorts": {r["cohort"]: {k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in r.items()} for r in cohort_summary_rows},
+            "by_position": [{k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in r.items()} for r in pos_summary_rows],
+        }
+        summary_json = output_dir / "block_analysis_summary.json"
+        with open(summary_json, "w") as f:
+            json.dump(summary_data, f, indent=2)
+        
+        # Write markdown report
+        report_md = output_dir / "block_analysis_report.md"
+        lines = ["# Block Analysis Report", ""]
+        lines.append(f"Dataset: **{args.dataset}**")
+        lines.append(f"Block size: **{block_size}**")
+        lines.append(f"Total blocks: **{len(block_analysis_collector)}**")
+        lines.append(f"Total position records: **{len(flat_rows)}**")
+        lines.append("")
+        
+        lines.append("## Per-Cohort Summary")
+        lines.append("| cohort | count | pos_rank | cd_rank | delta_rank | top1 | cd_top1 | top5 | cd_top5 | draft_match | entropy |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for r in cohort_summary_rows:
+            lines.append(
+                f"| {r['cohort']} | {r['count']} | "
+                f"{r['pos_rank_mean']:.2f} | {r['cd_rank_mean']:.2f} | {r['delta_rank_mean']:+.3f} | "
+                f"{r['top1_rate']*100:.1f}% | {r['cd_top1_rate']*100:.1f}% | "
+                f"{r['top5_rate']*100:.1f}% | {r['cd_top5_rate']*100:.1f}% | "
+                f"{r['draft_match_rate']*100:.1f}% | {r['entropy_mean']:.3f} |"
+            )
+        lines.append("")
+        
+        lines.append("## Per-Position Profile")
+        lines.append("| pos | cohort | count | pos_rank | cd_rank | delta_rank | top1 | cd_top1 | draft_match |")
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|")
+        for r in pos_summary_rows:
+            lines.append(
+                f"| {r['block_position']} | {r['cohort']} | {r['count']} | "
+                f"{r['pos_rank_mean']:.2f} | {r['cd_rank_mean']:.2f} | {r['delta_rank_mean']:+.3f} | "
+                f"{r['top1_rate']*100:.1f}% | {r['cd_top1_rate']*100:.1f}% | "
+                f"{r['draft_match_rate']*100:.1f}% |"
+            )
+        lines.append("")
+        
+        with open(report_md, "w") as f:
+            f.write("\n".join(lines))
+        
+        print(f"Block analysis artifacts saved to: {output_dir}")
+        print(f"  - {analysis_jsonl.name}")
+        print(f"  - {analysis_csv.name}")
+        print(f"  - {pos_csv.name}")
+        print(f"  - {cohort_csv.name}")
+        print(f"  - {summary_json.name}")
+        print(f"  - {report_md.name}")
+
 
 if __name__ == "__main__":
     main()
