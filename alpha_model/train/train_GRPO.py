@@ -9,8 +9,6 @@ The loss combines a clipped surrogate objective with a KL penalty:
   L = -E[ min(r * A, clip(r) * A) ] + beta * KL(pi_theta || pi_ref)
 
 Supports both fixed-beta and adaptive-beta KL scheduling.
-
-Reference: DeepSeekMath (https://arxiv.org/abs/2402.03300)
 """
 
 import argparse

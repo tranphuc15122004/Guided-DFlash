@@ -4,7 +4,7 @@
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=48GB
-#PBS -l walltime=01:00:00
+#PBS -l walltime=02:00:00
 #PBS -l storage=scratch/jp09+gdata/hn98
 #PBS -j oe
 #PBS -V
@@ -52,7 +52,7 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-4B}"
 DRAFT_NAME="${DRAFT_NAME:-z-lab/Qwen3-4B-DFlash-b16}"
 DATASET="${DATASET:-gsm8k}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
-MAX_SAMPLES="${MAX_SAMPLES:-128}"
+MAX_SAMPLES="${MAX_SAMPLES:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 CD_ALPHA="${CD_ALPHA:-0.1}"

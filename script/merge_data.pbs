@@ -55,8 +55,8 @@ if ! "$PYTHON_BIN" -c "import numpy" 2>/dev/null; then
 fi
 echo "[INFO] numpy OK: $("$PYTHON_BIN" -c "import numpy; print(numpy.__version__)")"
 
-INPUT_DIR="${INPUT_DIR:-alpha_model/collected_alpha_records}"
-OUTPUT_FILE="${OUTPUT_FILE:-alpha_model/alpha_dataset_001.h5}"
+INPUT_DIR="${INPUT_DIR:-alpha_model/collected_alpha_records_darft}"
+OUTPUT_FILE="${OUTPUT_FILE:-alpha_model/alpha_dataset_002.h5}"
 COMPRESSION="${COMPRESSION:-lzf}"
 
 if [[ ! -d "$INPUT_DIR" ]]; then

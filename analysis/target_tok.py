@@ -296,6 +296,8 @@ def dflash_generate(
     acceptance_lengths = []
     draft_prefill = True
     
+    # GPU-side buffer for AR predictions — accumulates on device and flushes to CPU once at the end
+    gpu_ar_buffer: List[torch.Tensor] = []
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -374,19 +376,24 @@ def dflash_generate(
         # Number of remaining positions after the bonus token to predict via AR
         num_ar_steps = block_size - acceptance_length - 2
 
-        # AR target model prediction (non-intrusive: save/restore KV cache)
-        # Seed = bonus token (posterior[:, acceptance_length]) at current `start` position
-        ar_seed_tok = output_ids[:, start : start + 1]
-        ar_position_ids = position_ids[:, start : start + 1]
-        # Stacked tensor: row 0 = absolute positions, row 1 = predicted token IDs
-        # (2, block_size+1) — unfilled entries remain mask_token_id
-        ar_target_tok_pred_stacked = torch.full(
-            (2, block_size + 1),
-            mask_token_id,
-            dtype=torch.long,
-            device=model.device,
+        # ── Only run expensive AR prediction when needed by a collector ──
+        need_ar_prediction = (
+            ar_target_tok_prediction_collector is not None
+            or block_analysis_collector is not None
         )
-        if block_size > 1 and num_ar_steps > 0:
+        if block_size > 1 and num_ar_steps > 0 and need_ar_prediction:
+            # AR target model prediction (non-intrusive: save/restore KV cache)
+            # Seed = bonus token (posterior[:, acceptance_length]) at current `start` position
+            ar_seed_tok = output_ids[:, start : start + 1]
+            ar_position_ids_local = position_ids[:, start : start + 1]
+
+            ar_target_tok_pred_stacked = torch.full(
+                (2, block_size + 1),
+                mask_token_id,
+                dtype=torch.long,
+                device=model.device,
+            )
+
             # Save a snapshot of the current KV cache length
             ar_cache_len = past_key_values_target.get_seq_length()
             
@@ -395,34 +402,36 @@ def dflash_generate(
                 ar_target_tok_pred_stacked[0, ar_step_idx] = abs_pos  # absolute position
                 ar_output = target(
                     ar_seed_tok,
-                    position_ids=ar_position_ids,
+                    position_ids=ar_position_ids_local,
                     past_key_values=past_key_values_target,
                     use_cache=True,
                 )
                 ar_next_token = sample(ar_output.logits, temperature , gen=gen)
                 ar_target_tok_pred_stacked[1, ar_step_idx] = ar_next_token
                 ar_seed_tok = ar_next_token
-                ar_position_ids += 1
+                ar_position_ids_local += 1
             
             # Restore cache to pre-AR state so speculative loop is unaffected
             past_key_values_target.crop(ar_cache_len)
         
-        if ar_target_tok_prediction_collector is not None:
-            ar_target_tok_prediction_collector.append(ar_target_tok_pred_stacked.cpu())
+        # Keep AR predictions on GPU, flush to CPU collector at the end of generation
+        if (
+            ar_target_tok_prediction_collector is not None
+            and block_size > 1
+            and num_ar_steps > 0
+            and need_ar_prediction
+        ):
+            gpu_ar_buffer.append(ar_target_tok_pred_stacked)  # stays on GPU
             
         
-        # Build full-block target reference:
-        #   [0]            = seeded token
-        #   [1..acc_len]   = accepted draft tokens
-        #   [acc_len+1]    = bonus token (posterior[:, acceptance_length])
-        #   [acc_len+2..]  = AR predictions (if num_ar_steps > 0)
-        tmp_target_tok_ids = torch.full((1, block_size), mask_token_id, dtype=torch.long, device=model.device)
-        tmp_target_tok_ids[:, : acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
-        if acceptance_length + 1 < block_size:
-            tmp_target_tok_ids[:, acceptance_length + 1] = posterior[:, acceptance_length]  # bonus token
-        if num_ar_steps > 0:
-            tmp_target_tok_ids[:, acceptance_length + 2:] = ar_target_tok_pred_stacked[1, :num_ar_steps]
-        
+        # Build full-block target reference (only needed by collectors)
+        if block_analysis_collector is not None:
+            tmp_target_tok_ids = torch.full((1, block_size), mask_token_id, dtype=torch.long, device=model.device)
+            tmp_target_tok_ids[:, : acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+            if acceptance_length + 1 < block_size:
+                tmp_target_tok_ids[:, acceptance_length + 1] = posterior[:, acceptance_length]  # bonus token
+            if num_ar_steps > 0 and need_ar_prediction:
+                tmp_target_tok_ids[:, acceptance_length + 2:] = ar_target_tok_pred_stacked[1, :num_ar_steps]
         
         # ── Per-position analysis: target rank in positive & CD logits ──
         if block_analysis_collector is not None and block_size > 1:
@@ -480,6 +489,12 @@ def dflash_generate(
         if stop_token_indices.numel() > 0:
             output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
 
+    # Flush GPU AR buffer to CPU collector in one go
+    if ar_target_tok_prediction_collector is not None and gpu_ar_buffer:
+        for t in gpu_ar_buffer:
+            ar_target_tok_prediction_collector.append(t.cpu())
+        gpu_ar_buffer.clear()
+
     if output_ids_collector is not None:
         output_ids_collector.append(output_ids.cpu())
 
@@ -524,6 +539,30 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable fully deterministic behavior for reproducible runs.",
+    )
+    parser.add_argument(
+        "--collect-divergence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute and accumulate KL divergence between pos/neg draft logits each block.",
+    )
+    parser.add_argument(
+        "--collect-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save generated output IDs to disk (requires extra CPU memory).",
+    )
+    parser.add_argument(
+        "--collect-block-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect per-position rank/logprob stats every block (triggers expensive AR prediction loop).",
+    )
+    parser.add_argument(
+        "--collect-target-tok-preds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect AR target-model predictions for suffix positions (triggers expensive AR prediction loop).",
     )
     parser.add_argument(
         "--output-dir", type=str, default="./analysis/results", help="Directory to save outputs and logs."
@@ -581,10 +620,10 @@ def main() -> None:
     if args.max_samples is not None and len(dataset) > args.max_samples:
         dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
-    divergence_accumulator: List[float] = [] 
-    output_ids_collector: List[torch.Tensor] = []
-    target_tok_prediction_collector: List[torch.Tensor] = []
-    block_analysis_collector: List[dict] = []
+    divergence_accumulator: Optional[List[float]] = ([] if args.collect_divergence else None)
+    output_ids_collector: Optional[List[torch.Tensor]] = ([] if args.collect_outputs else None)
+    target_tok_prediction_collector: Optional[List[torch.Tensor]] = ([] if args.collect_target_tok_preds else None)
+    block_analysis_collector: Optional[List[dict]] = ([] if args.collect_block_analysis else None)
 
     responses = []
     indices = range(dist.rank(), len(dataset), dist.size())
