@@ -1,0 +1,57 @@
+================================================
+Job:    fix_target_token
+Node:   gadi-cpu-bdw-0026.gadi.nci.org.au
+PWD:    /scratch/jp09/dd9648/Guided-DFlash
+Date:   Tue May 19 01:36:40 AEST 2026
+================================================
+Python: /scratch/jp09/dd9648/venvs/dflash_h100/bin/python3
+PyTorch: 2.5.1+cu121
+
+Input dir:   /scratch/jp09/dd9648/Guided-DFlash/alpha_model/collected_alpha_records_darft
+Backup dir:  /scratch/jp09/dd9648/Guided-DFlash/alpha_model/collected_alpha_records_darft.BACKUP
+Workers:     8
+
+================================================
+Phase 1: Backup
+================================================
+Found 58 subdirs to process
+Backup:   0%|          | 0/58 [00:00<?, ?subdir/s]Backup: 100%|██████████| 58/58 [00:00<00:00, 6480.28subdir/s]
+Backup done: 0.0s
+
+================================================
+Phase 2: Fix target_token_id
+================================================
+Input:    /scratch/jp09/dd9648/Guided-DFlash/alpha_model/collected_alpha_records_darft
+Backup:   /scratch/jp09/dd9648/Guided-DFlash/alpha_model/collected_alpha_records_darft.BACKUP
+Subdirs:  58
+Workers:  8
+Dry run:  False
+Resume:   False
+
+============================================================
+Phase 2: Fix target_token_id
+============================================================
+Fix:   0%|          | 0/58 [00:00<?, ?subdir/s]Fix:   2%|▏         | 1/58 [00:35<33:16, 35.03s/subdir]Fix:   3%|▎         | 2/58 [01:09<32:33, 34.89s/subdir]Fix:   5%|▌         | 3/58 [01:10<17:30, 19.10s/subdir]Fix:   7%|▋         | 4/58 [01:10<10:41, 11.88s/subdir]Fix:   9%|▊         | 5/58 [01:12<07:06,  8.04s/subdir]Fix:  10%|█         | 6/58 [01:15<05:31,  6.38s/subdir]Fix:  12%|█▏        | 7/58 [01:15<03:44,  4.41s/subdir]Fix:  14%|█▍        | 8/58 [01:20<03:43,  4.48s/subdir]Fix:  16%|█▌        | 9/58 [02:05<14:02, 17.19s/subdir]Fix:  17%|█▋        | 10/58 [03:14<26:30, 33.15s/subdir]Fix:  19%|█▉        | 11/58 [03:34<22:50, 29.17s/subdir]Fix:  21%|██        | 12/58 [03:37<16:10, 21.09s/subdir]Fix:  22%|██▏       | 13/58 [03:38<11:20, 15.12s/subdir]Fix:  24%|██▍       | 14/58 [03:40<08:06, 11.05s/subdir]Fix:  26%|██▌       | 15/58 [04:05<11:01, 15.38s/subdir]Fix:  28%|██▊       | 16/58 [04:29<12:36, 18.00s/subdir]Fix:  29%|██▉       | 17/58 [04:34<09:42, 14.20s/subdir]Fix:  31%|███       | 18/58 [05:41<19:52, 29.81s/subdir]Fix:  33%|███▎      | 19/58 [06:00<17:20, 26.67s/subdir]Fix:  34%|███▍      | 20/58 [06:03<12:27, 19.68s/subdir]Fix:  36%|███▌      | 21/58 [06:05<08:45, 14.19s/subdir]Fix:  38%|███▊      | 22/58 [06:10<06:56, 11.57s/subdir]Fix:  40%|███▉      | 23/58 [06:54<12:25, 21.30s/subdir]Fix:  41%|████▏     | 24/58 [07:06<10:24, 18.36s/subdir]Fix:  43%|████▎     | 25/58 [07:43<13:13, 24.06s/subdir]Fix:  45%|████▍     | 26/58 [08:02<11:59, 22.49s/subdir]Fix:  47%|████▋     | 27/58 [08:21<11:04, 21.42s/subdir]Fix:  48%|████▊     | 28/58 [08:22<07:44, 15.48s/subdir]Fix:  50%|█████     | 29/58 [08:41<07:53, 16.33s/subdir]Fix:  52%|█████▏    | 30/58 [08:46<06:06, 13.08s/subdir]Fix:  53%|█████▎    | 31/58 [09:28<09:46, 21.73s/subdir]Fix:  55%|█████▌    | 32/58 [09:42<08:19, 19.21s/subdir]Fix:  57%|█████▋    | 33/58 [10:16<09:56, 23.84s/subdir]Fix:  59%|█████▊    | 34/58 [10:18<06:54, 17.26s/subdir]Fix:  60%|██████    | 35/58 [10:24<05:20, 13.93s/subdir]Fix:  62%|██████▏   | 36/58 [10:39<05:13, 14.24s/subdir]Fix:  64%|██████▍   | 37/58 [10:59<05:37, 16.05s/subdir]Fix:  66%|██████▌   | 38/58 [11:02<03:58, 11.95s/subdir]Fix:  67%|██████▋   | 39/58 [11:02<02:42,  8.54s/subdir]Fix:  69%|██████▉   | 40/58 [11:10<02:30,  8.37s/subdir]Fix:  71%|███████   | 41/58 [11:39<04:07, 14.55s/subdir]Fix:  72%|███████▏  | 42/58 [11:42<02:56, 11.06s/subdir]Fix:  74%|███████▍  | 43/58 [11:49<02:26,  9.80s/subdir]Fix:  76%|███████▌  | 44/58 [11:49<01:36,  6.89s/subdir]Fix:  78%|███████▊  | 45/58 [12:11<02:29, 11.47s/subdir]Fix:  79%|███████▉  | 46/58 [12:23<02:17, 11.43s/subdir]Fix:  81%|████████  | 47/58 [12:30<01:50, 10.05s/subdir]Fix:  83%|████████▎ | 48/58 [12:37<01:32,  9.27s/subdir]Fix:  84%|████████▍ | 49/58 [12:57<01:53, 12.60s/subdir]Fix:  86%|████████▌ | 50/58 [13:03<01:23, 10.43s/subdir]Fix:  88%|████████▊ | 51/58 [13:05<00:56,  8.06s/subdir]Fix:  90%|████████▉ | 52/58 [13:13<00:48,  8.10s/subdir]Fix:  91%|█████████▏| 53/58 [13:26<00:47,  9.44s/subdir]Fix:  93%|█████████▎| 54/58 [13:31<00:32,  8.06s/subdir]Fix:  95%|█████████▍| 55/58 [13:51<00:34, 11.59s/subdir]Fix:  97%|█████████▋| 56/58 [14:07<00:26, 13.09s/subdir]Fix:  98%|█████████▊| 57/58 [14:12<00:10, 10.50s/subdir]Fix: 100%|██████████| 58/58 [14:30<00:00, 12.88s/subdir]Fix: 100%|██████████| 58/58 [14:30<00:00, 15.01s/subdir]
+
+Processed: 4071799 records across 58 subfolders
+Modified:  3084505 records (blocks with at least 1 fixed position)
+Duration:  870.9s (15.0s/subdir)
+
+All files updated in-place.
+
+================================================
+Job complete at Tue May 19 01:51:37 AEST 2026
+Log: /scratch/jp09/dd9648/Guided-DFlash/logs/fix_target_token_168714800.gadi-pbs.log
+================================================
+
+======================================================================================
+                  Resource Usage on 2026-05-19 01:51:40:
+   Job Id:             168714800.gadi-pbs
+   Project:            hn98
+   Exit Status:        0
+   Service Units:      7.56
+   NCPUs Requested:    24                  CPU Time Used: 01:48:26        
+   Memory Requested:   96.0GB                Memory Used: 44.41GB         
+   Walltime Requested: 06:00:00            Walltime Used: 00:15:07        
+   JobFS Requested:    100.0MB                JobFS Used: 0B              
+======================================================================================

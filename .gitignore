@@ -17,3 +17,7 @@ train_alpha_h200.pbs.o*
 debug_h100_flash.pbs.o*
 alpha_model/collected_alpha_records_darft
 .AI
+analysis/results
+analysis/alpha_training_reports_001
+analysis/alpha_training_reports_168269509
+alpha_model/collected_alpha_records_darft.BACKUP

@@ -39,14 +39,34 @@ import flash_attn
 print('flash_attn', flash_attn.__version__)
 PY
 
-export SCHEME=${SCHEME:-CD_alpha_model}
+export SCHEME=${SCHEME:-VCD_v2}
 export MAX_SAMPLES=${MAX_SAMPLES:-128}
+export CD_ALPHA=${CD_ALPHA:-0.6}
+export VCD_ALPHA=${VCD_ALPHA:-0.1}
 
 # If ALPHA_MODEL_PATH is set, pass it via EXTRA_BENCHMARK_ARGS
 if [[ -n "${ALPHA_MODEL_PATH:-}" ]]; then
   export EXTRA_BENCHMARK_ARGS="${EXTRA_BENCHMARK_ARGS:-} --alpha-model-path $ALPHA_MODEL_PATH"
   echo "Using alpha model: $ALPHA_MODEL_PATH"
 else
-  echo "No alpha model set. Using fixed cd-alpha=0.6 (baseline)"
+  echo "No alpha model set. Using fixed alpha baseline"
 fi
+
+  case "$SCHEME" in
+    CD_v2)
+      EXTRA_BENCHMARK_ARGS="${EXTRA_BENCHMARK_ARGS:-} --cd-alpha $CD_ALPHA"
+      echo "Using CD alpha: $CD_ALPHA"
+      ;;
+    VCD_v2)
+      EXTRA_BENCHMARK_ARGS="${EXTRA_BENCHMARK_ARGS:-} --vcd-alpha $VCD_ALPHA"
+      echo "Using VCD alpha: $VCD_ALPHA"
+      ;;
+    *)
+      echo "SCHEME=$SCHEME does not use an alpha flag"
+      ;;
+  esac
+  export EXTRA_BENCHMARK_ARGS
+
+echo "SCHEME: $SCHEME"
+echo "Command: bash run_benchmark.sh"
 exec bash run_benchmark.sh

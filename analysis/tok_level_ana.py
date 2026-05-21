@@ -220,6 +220,19 @@ def _estimate_token_hit_probability(
     )
 
 
+def _compute_target_token_stats(logits_1d: torch.Tensor, target_token_id: int) -> dict[str, Any]:
+    logits = logits_1d.float()
+    rank = _token_rank_from_logits(logits, target_token_id)
+    logprob = float(torch.log_softmax(logits, dim=-1)[target_token_id].item())
+    return {
+        "rank": int(rank),
+        "logprob": logprob,
+        "top1_hit": int(rank <= 1),
+        "top5_hit": int(rank <= 5),
+        "top10_hit": int(rank <= 10),
+    }
+
+
 def _build_reject_reason(record: dict[str, Any]) -> str:
     return token_level_reporting.build_reject_reason(record)
 
@@ -315,10 +328,13 @@ def _build_ar_target_rank_record(
     acceptance_length: int,
     token_source: str,
     target_token_id: int,
+    committed_token_id: int,
     positive_step_logits: torch.Tensor,
     tokenizer: AutoTokenizer,
 ) -> dict[str, Any]:
     target_stats = _compute_target_token_stats(positive_step_logits, target_token_id)
+    # Also compute rank of the committed token for comparison
+    committed_stats = _compute_target_token_stats(positive_step_logits, committed_token_id)
     return {
         "sample_idx": int(sample_idx),
         "turn_idx": int(turn_idx),
@@ -335,6 +351,13 @@ def _build_ar_target_rank_record(
         "positive_top1_hit": int(target_stats["top1_hit"]),
         "positive_top5_hit": int(target_stats["top5_hit"]),
         "positive_top10_hit": int(target_stats["top10_hit"]),
+        "committed_token_id": int(committed_token_id),
+        "committed_token_text": _token_str(tokenizer, committed_token_id),
+        "committed_rank": int(committed_stats["rank"]),
+        "committed_logprob": float(committed_stats["logprob"]),
+        "committed_top1_hit": int(committed_stats["top1_hit"]),
+        "committed_top5_hit": int(committed_stats["top5_hit"]),
+        "committed_top10_hit": int(committed_stats["top10_hit"]),
         "is_after_acceptance_length": int(block_position > acceptance_length),
     }
 
@@ -376,6 +399,8 @@ def _build_ar_target_rank_summary(
             "rank_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
             "logprob_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
             "topk_hit_rates": {"top1": 0.0, "top5": 0.0, "top10": 0.0},
+            "committed_rank_distribution": _describe_distribution(np.asarray([], dtype=np.float64)),
+            "committed_topk_hit_rates": {"top1": 0.0, "top5": 0.0, "top10": 0.0},
             "block_position_profile": [],
         }
         return summary, []
@@ -396,6 +421,12 @@ def _build_ar_target_rank_summary(
     top1_values = np.asarray([row["positive_top1_hit"] for row in records], dtype=np.float64)
     top5_values = np.asarray([row["positive_top5_hit"] for row in records], dtype=np.float64)
     top10_values = np.asarray([row["positive_top10_hit"] for row in records], dtype=np.float64)
+    # Committed token stats (for AR suffix, committed != target due to sampling)
+    committed_rank_values = np.asarray([row["committed_rank"] for row in records], dtype=np.float64)
+    committed_logprob_values = np.asarray([row["committed_logprob"] for row in records], dtype=np.float64)
+    committed_top1_values = np.asarray([row["committed_top1_hit"] for row in records], dtype=np.float64)
+    committed_top5_values = np.asarray([row["committed_top5_hit"] for row in records], dtype=np.float64)
+    committed_top10_values = np.asarray([row["committed_top10_hit"] for row in records], dtype=np.float64)
     token_source_counts = Counter(row.get("token_source", "unknown") for row in records)
 
     position_rows: list[dict[str, Any]] = []
@@ -407,6 +438,8 @@ def _build_ar_target_rank_summary(
         top1 = np.asarray([row["positive_top1_hit"] for row in subset], dtype=np.float64)
         top5 = np.asarray([row["positive_top5_hit"] for row in subset], dtype=np.float64)
         top10 = np.asarray([row["positive_top10_hit"] for row in subset], dtype=np.float64)
+        committed_ranks = np.asarray([row["committed_rank"] for row in subset], dtype=np.float64)
+        committed_top1 = np.asarray([row["committed_top1_hit"] for row in subset], dtype=np.float64)
 
         count = max(1, len(subset))
         position_rows.append(
@@ -435,6 +468,9 @@ def _build_ar_target_rank_summary(
                 "top1_rate": float(top1.mean()) if top1.size else 0.0,
                 "top5_rate": float(top5.mean()) if top5.size else 0.0,
                 "top10_rate": float(top10.mean()) if top10.size else 0.0,
+                "committed_rank_mean": float(committed_ranks.mean()) if committed_ranks.size else 0.0,
+                "committed_rank_median": float(np.quantile(committed_ranks, 0.50)) if committed_ranks.size else 0.0,
+                "committed_top1_rate": float(committed_top1.mean()) if committed_top1.size else 0.0,
             }
         )
 
@@ -465,6 +501,12 @@ def _build_ar_target_rank_summary(
             "top1": float(top1_values.mean()) if top1_values.size else 0.0,
             "top5": float(top5_values.mean()) if top5_values.size else 0.0,
             "top10": float(top10_values.mean()) if top10_values.size else 0.0,
+        },
+        "committed_rank_distribution": _describe_distribution(committed_rank_values),
+        "committed_topk_hit_rates": {
+            "top1": float(committed_top1_values.mean()) if committed_top1_values.size else 0.0,
+            "top5": float(committed_top5_values.mean()) if committed_top5_values.size else 0.0,
+            "top10": float(committed_top10_values.mean()) if committed_top10_values.size else 0.0,
         },
         "block_position_profile": position_rows,
     }
@@ -498,11 +540,23 @@ def _write_ar_target_rank_report_md(
     lines.append(f"- Records: **{summary.get('num_records', 0)}**")
     lines.append(f"- Blocks: **{summary.get('num_blocks', 0)}**")
     lines.append(f"- Acceptance length mean: **{summary.get('acceptance_length_distribution', {}).get('mean', 0.0):.2f}**")
-    lines.append(f"- Positive rank mean: **{summary.get('rank_distribution', {}).get('mean', 0.0):.2f}**")
-    lines.append(f"- Positive rank median: **{summary.get('rank_distribution', {}).get('median', 0.0):.2f}**")
+    lines.append("")
+    lines.append("### Rerun Target (argmax) Stats")
+    lines.append(f"- Rank mean: **{summary.get('rank_distribution', {}).get('mean', 0.0):.2f}**")
+    lines.append(f"- Rank median: **{summary.get('rank_distribution', {}).get('median', 0.0):.2f}**")
     lines.append(
         f"- Top-1 / Top-5 / Top-10: **{summary.get('topk_hit_rates', {}).get('top1', 0.0) * 100:.2f}% / {summary.get('topk_hit_rates', {}).get('top5', 0.0) * 100:.2f}% / {summary.get('topk_hit_rates', {}).get('top10', 0.0) * 100:.2f}%**"
     )
+    lines.append("")
+    lines.append("### Committed Token (sampled) Stats")
+    committed_rank = summary.get('committed_rank_distribution', {})
+    committed_topk = summary.get('committed_topk_hit_rates', {})
+    lines.append(f"- Rank mean: **{committed_rank.get('mean', 0.0):.2f}**")
+    lines.append(f"- Rank median: **{committed_rank.get('median', 0.0):.2f}**")
+    lines.append(
+        f"- Top-1 / Top-5 / Top-10: **{committed_topk.get('top1', 0.0) * 100:.2f}% / {committed_topk.get('top5', 0.0) * 100:.2f}% / {committed_topk.get('top10', 0.0) * 100:.2f}%**"
+    )
+    lines.append("")
     source_counts = summary.get("token_source_counts", {})
     lines.append(
         f"- Token source counts: verify **{source_counts.get('verify', 0)}**, ar_suffix **{source_counts.get('ar_suffix', 0)}**"
@@ -510,8 +564,8 @@ def _write_ar_target_rank_report_md(
     lines.append("")
 
     lines.append("## Per-Position Summary")
-    lines.append("| pos | count | verify | ar_suffix | verify_rate | rank_mean | rank_median | logprob_mean | top1 | top5 | top10 |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| pos | count | verify | ar_suffix | verify_rate | rank_mean | rank_median | logprob_mean | top1 | top5 | top10 | comm_rank | comm_top1 |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     rows = summary.get("block_position_profile", [])
     for row in rows[:max_rows]:
         lines.append(
@@ -526,7 +580,9 @@ def _write_ar_target_rank_report_md(
             f"{row.get('logprob_mean', 0.0):.4f} | "
             f"{row.get('top1_rate', 0.0) * 100:.2f}% | "
             f"{row.get('top5_rate', 0.0) * 100:.2f}% | "
-            f"{row.get('top10_rate', 0.0) * 100:.2f}% |"
+            f"{row.get('top10_rate', 0.0) * 100:.2f}% | "
+            f"{row.get('committed_rank_mean', 0.0):.2f} | "
+            f"{row.get('committed_top1_rate', 0.0) * 100:.2f}% |"
         )
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -562,6 +618,7 @@ def dflash_generate(
     divergence_accumulator: Optional[List[float]] = None,
     reject_records: Optional[list[dict[str, Any]]] = None,
     ar_rank_records: Optional[list[dict[str, Any]]] = None,
+    block_ar_records: Optional[list[dict[str, Any]]] = None,
     cd_shadow_num_samples: int = 1,
     sample_idx: int = -1,
     turn_idx: int = -1,
@@ -657,60 +714,80 @@ def dflash_generate(
         posterior = sample(output.logits, temperature, gen=gen)
         acceptance_length = int((block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item())
 
-        block_start = start
-        committed_block_ids = block_output_ids.clone()
-        committed_hidden_chunks: list[torch.Tensor] = []
-        if block_size > 1:
-            committed_hidden_chunks.append(
-                extract_context_feature(output.hidden_states, model.target_layer_ids)[:, : acceptance_length + 1, :]
-            )
+        # ── Accept/reject + commit (CD_v2) ──
+        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-        seed_token = posterior[:, acceptance_length : acceptance_length + 1]
+        new_start = start + acceptance_length + 1
+        acceptance_lengths.append(acceptance_length + 1)
+        decode_step += 1
+
+        if block_size > 1:
+            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
+
+        # ── AR rerun prediction (for analysis only) ──
+        # rerun_target_ids: target AR argmax at positions acceptance_length+1..block_size-1
+        # Khong anh huong output_ids -- chi de so sanh voi verify cua block tiep theo
+        rerun_target_ids = block_output_ids.clone()
         if block_size > 1 and acceptance_length < (block_size - 1):
-            past_key_values_target.crop(block_start + acceptance_length + 1)
-            next_token = seed_token
+            past_key_values_target.crop(start + acceptance_length + 1)
+            prev_token = block_output_ids[:, acceptance_length : acceptance_length + 1]
             for block_position in range(acceptance_length + 1, block_size):
-                committed_block_ids[:, block_position] = next_token[:, 0]
                 ar_output = target(
-                    next_token,
-                    position_ids=position_ids[:, block_start + block_position : block_start + block_position + 1],
+                    prev_token,
+                    position_ids=position_ids[:, start + block_position - 1 : start + block_position],
                     past_key_values=past_key_values_target,
                     use_cache=True,
-                    output_hidden_states=True,
+                    output_hidden_states=False,
                 )
-                committed_hidden_chunks.append(
-                    extract_context_feature(ar_output.hidden_states, model.target_layer_ids)
-                )
+                rerun_target_ids[:, block_position] = ar_output.logits[0, -1, :].argmax(dim=-1)
                 next_token = sample(ar_output.logits, temperature, gen=gen)
-            seed_token = next_token
+                prev_token = next_token
 
-        if block_size > 1:
-            target_hidden = torch.cat(committed_hidden_chunks, dim=1)
+        # ── Save per-block AR data with absolute positions ──
+        if block_ar_records is not None and block_size > 1:
+            ar_predictions = {}
+            if acceptance_length < (block_size - 1):
+                for bp in range(acceptance_length + 1, block_size):
+                    abs_pos = int(start + bp)
+                    ar_predictions[abs_pos] = int(rerun_target_ids[0, bp].item())
+            block_ar_records.append({
+                "sample_idx": sample_idx,
+                "turn_idx": turn_idx,
+                "decode_step": decode_step,
+                "block_start": int(start),
+                "acceptance_length": acceptance_length,
+                "bonus_token": int(posterior[0, acceptance_length].item()),
+                "ar_predictions": ar_predictions,
+            })
 
+        # ── Analysis records ──
         if ar_rank_records is not None and block_size > 1:
             stop_token_set = set(stop_token_ids or [])
             max_record_position = block_size - 1
             if stop_token_set:
                 for block_position in range(1, block_size):
-                    token_id = int(committed_block_ids[0, block_position].item())
+                    token_id = int(block_output_ids[0, block_position].item())
                     if token_id in stop_token_set:
                         max_record_position = block_position
                         break
 
             for block_position in range(1, max_record_position + 1):
                 token_source = "verify" if block_position <= acceptance_length else "ar_suffix"
-                target_token_id = int(committed_block_ids[0, block_position].item())
+                committed_token_id = int(block_output_ids[0, block_position].item())
+                target_token_id = int(rerun_target_ids[0, block_position].item())
                 positive_step_logits = positive_draft_logits[0, block_position - 1, :].float()
                 ar_rank_records.append(
                     _build_ar_target_rank_record(
                         sample_idx=sample_idx,
                         turn_idx=turn_idx,
                         decode_step=decode_step,
-                        block_start_position=block_start,
+                        block_start_position=start,
                         block_position=block_position,
                         acceptance_length=acceptance_length,
                         token_source=token_source,
                         target_token_id=target_token_id,
+                        committed_token_id=committed_token_id,
                         positive_step_logits=positive_step_logits,
                         tokenizer=tokenizer,
                     )
@@ -746,14 +823,8 @@ def dflash_generate(
                 )
             )
 
-        output_ids[:, block_start : block_start + block_size] = committed_block_ids
-        output_ids[:, block_start + block_size] = seed_token[:, 0]
-
-        acceptance_lengths.append(acceptance_length + 1)
-        start += block_size
-        decode_step += 1
-
-        past_key_values_target.crop(start)
+        past_key_values_target.crop(new_start)
+        start = new_start
 
         if stop_token_ids is not None and any(
             stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
@@ -793,7 +864,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--cd-alpha", "--vcd-alpha", dest="cd_alpha", type=float, default=0.6)
+    parser.add_argument("--cd-alpha", "--vcd-alpha", dest="cd_alpha", type=float, default=0.5)
     parser.add_argument("--cd-beta", "--vcd-beta", dest="cd_beta", type=float, default=0.0)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
     parser.add_argument("--negative-context-noise-std", type=float, default=0.0)
