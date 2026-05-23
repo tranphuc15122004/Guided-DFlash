@@ -1,0 +1,192 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=48GB
+#PBS -l walltime=12:00:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+
+# ═══════════════════════════════════════════════════════════
+# Phase 1: Supervised Pre-training for NegativeLogitPredictor
+#
+# Trains the model to predict negative logits such that the
+# target token ranks #1 in top-K after Contrastive Decoding.
+#
+# Usage:
+#   qsub script/train_negative_predictor_phase1.pbs
+#
+# Override defaults via -v:
+#   qsub -v EPOCHS=50,LR=1e-4,DEBUG=1 script/train_negative_predictor_phase1.pbs
+# ═══════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+  cd "$PBS_O_WORKDIR"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+mkdir -p logs
+
+JOB_TAG="${PBS_JOBID:-local_$(date +%Y%m%d_%H%M%S)}"
+LOG_FILE="logs/train_neg_pred_phase1_${JOB_TAG}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ── Activate venv ──
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
+mkdir -p "$HF_HOME"
+
+echo "═══════════════════════════════════════════════════"
+echo "  Phase 1: NegativeLogitPredictor Supervised Training"
+echo "═══════════════════════════════════════════════════"
+echo ""
+echo "Job ID:       ${PBS_JOBID:-local}"
+echo "Node:         $(hostname)"
+echo "Start time:   $(date)"
+echo "Work dir:     $(pwd)"
+echo ""
+
+# ── Environment info ──
+python - <<'PY'
+import torch
+print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}')
+print(f'CUDA version: {torch.version.cuda}')
+import h5py; print(f'h5py {h5py.__version__}')
+try:
+    import flash_attn; print(f'flash_attn {flash_attn.__version__}')
+except: print('flash_attn: not installed')
+PY
+echo ""
+
+# ── Configuration (override via env vars) ──
+H5_PATH="${H5_PATH:-alpha_model/alpha_dataset_002.h5}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/phase1_${JOB_TAG}}"
+BATCH_SIZE="${BATCH_SIZE:-1024}"
+EPOCHS="${EPOCHS:-1000}"
+LR="${LR:-3e-4}"
+TOP_K="${TOP_K:-32}"
+HIDDEN_DIM="${HIDDEN_DIM:-128}"
+LAMBDA_BCE="${LAMBDA_BCE:-0.2}"
+GAMMA_DECAY="${GAMMA_DECAY:-7.0}"
+EARLY_BOOST_N="${EARLY_BOOST_N:-6}"
+EARLY_BOOST_WEIGHT="${EARLY_BOOST_WEIGHT:-2.0}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+LR_MIN="${LR_MIN:-1e-5}"
+RESUME="${RESUME:-}"
+
+# Model variant flags (boolean: set to "1" to enable)
+DENSE="${DENSE:-1}"
+PREDICT_DELTA="${PREDICT_DELTA:-0}"
+
+# ── Debug mode: use subset if DEBUG=1 ──
+if [[ "${DEBUG:-0}" = "1" ]]; then
+  echo "=== DEBUG MODE: Using subset of data ==="
+  EPOCHS=2
+  BATCH_SIZE=16
+  MAX_RECORDS=500
+else
+  MAX_RECORDS=0
+fi
+
+echo "═══════════════════════════════════════════════════"
+echo "  Training Configuration"
+echo "═══════════════════════════════════════════════════"
+echo "H5_PATH:              $H5_PATH"
+echo "OUTPUT_DIR:           $OUTPUT_DIR"
+echo "BATCH_SIZE:           $BATCH_SIZE"
+echo "EPOCHS:               $EPOCHS"
+echo "LR:                   $LR"
+echo "LR_SCHEDULER:         $LR_SCHEDULER"
+echo "LR_MIN:               $LR_MIN"
+echo "TOP_K:                $TOP_K"
+echo "HIDDEN_DIM:           $HIDDEN_DIM"
+echo "LAMBDA_BCE:           $LAMBDA_BCE"
+echo "GAMMA_DECAY:          $GAMMA_DECAY"
+echo "EARLY_BOOST_N:        $EARLY_BOOST_N"
+echo "EARLY_BOOST_WEIGHT:   $EARLY_BOOST_WEIGHT"
+echo "MAX_GRAD_NORM:        $MAX_GRAD_NORM"
+echo "SAVE_INTERVAL:        $SAVE_INTERVAL"
+echo "MAX_RECORDS:          $MAX_RECORDS"
+echo "DENSE:                $DENSE"
+echo "PREDICT_DELTA:        $PREDICT_DELTA"
+echo "RESUME:               ${RESUME:-(none)}"
+echo ""
+
+# ── Build extra args ──
+EXTRA_ARGS=""
+
+if [[ "$DENSE" = "1" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --dense"
+  echo "[Flag] Using Dense MLP variant"
+fi
+
+if [[ "$PREDICT_DELTA" = "1" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --predict-delta"
+  echo "[Flag] Using delta mode (output = delta added to original neg_logits)"
+fi
+
+if [[ -n "$RESUME" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --resume $RESUME"
+  echo "[Flag] Resuming from checkpoint: $RESUME"
+fi
+
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Starting Phase 1 training at $(date)"
+echo "───────────────────────────────────────────────"
+
+# ── Train ──
+time python -m alpha_model.train.train_negative_predictor_phase1 \
+  --data-path "$H5_PATH" \
+  --output-dir "$OUTPUT_DIR" \
+  --max-records "$MAX_RECORDS" \
+  --batch-size "$BATCH_SIZE" \
+  --epochs "$EPOCHS" \
+  --lr "$LR" \
+  --top-k "$TOP_K" \
+  --hidden-dim "$HIDDEN_DIM" \
+  --lambda-bce "$LAMBDA_BCE" \
+  --gamma-decay "$GAMMA_DECAY" \
+  --early-boost-n "$EARLY_BOOST_N" \
+  --early-boost-weight "$EARLY_BOOST_WEIGHT" \
+  --max-grad-norm "$MAX_GRAD_NORM" \
+  --save-interval "$SAVE_INTERVAL" \
+  --lr-scheduler "$LR_SCHEDULER" \
+  --lr-min "$LR_MIN" \
+  $EXTRA_ARGS \
+  --device cuda
+
+EXIT_CODE=$?
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Training finished at $(date)"
+echo "  Exit code: $EXIT_CODE"
+echo "───────────────────────────────────────────────"
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo ""
+  echo "=== Phase 1 training completed successfully ==="
+  echo "Output directory: $OUTPUT_DIR"
+  ls -lh "$OUTPUT_DIR"/ 2>/dev/null || echo "(output dir may be empty)"
+  echo ""
+  echo "Best checkpoint: ${OUTPUT_DIR}/checkpoints/best.pt"
+  echo "Training history: ${OUTPUT_DIR}/training_history.csv"
+  echo ""
+  echo "To initialize Phase 2 RL training:"
+  echo "  qsub -v FROM_PHASE1=${OUTPUT_DIR}/checkpoints/best.pt script/train_negative_predictor_rl.pbs"
+else
+  echo ""
+  echo "=== Phase 1 training FAILED (exit code: $EXIT_CODE) ==="
+  echo "Check log file: $LOG_FILE"
+fi
+
+exit $EXIT_CODE

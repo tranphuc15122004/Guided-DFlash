@@ -246,6 +246,174 @@ def _check_alpha_value(
 
 
 
+# ──────────────────────────────────────────────────────
+# Reward simulation for NegativeLogitPredictor
+# Unlike the alpha model, this uses predicted_neg_logits directly
+# (not alpha-scaled neg_logits) with fixed alpha=1.0
+# ──────────────────────────────────────────────────────
+
+def apply_contrastive_with_predicted_neg_batch(
+    pos_logits: torch.Tensor,               # (B, S, K)
+    predicted_neg_logits: torch.Tensor,       # (B, S, K)
+) -> torch.Tensor:
+    """
+    Apply CD with predicted negative logits and fixed alpha=1.0.
+
+    CD = log_softmax(pos) - log_softmax(predicted_neg)
+    """
+    log_p_pos = F.log_softmax(pos_logits, dim=-1)
+    log_p_neg = F.log_softmax(predicted_neg_logits, dim=-1)
+    return log_p_pos - log_p_neg  # alpha = 1.0 fixed
+
+
+def simulate_acceptance_length_with_predicted_neg_batch(
+    pos_logits: torch.Tensor,               # (B, S, K)
+    predicted_neg_logits: torch.Tensor,       # (B, S, K)
+    topk_token_ids: torch.Tensor,             # (B, S, K)
+    target_token_ids: torch.Tensor,           # (B, S)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simulate acceptance length using predicted negative logits.
+
+    Returns:
+        acc_len: (B,) — number of consecutive accepted tokens from start
+        correct_mask: (B, S) — which tokens were accepted (within accepted segment)
+    """
+    pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids, _, single_sample = (
+        _ensure_batched_inputs_predicted_neg(
+            pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids,
+        )
+    )
+
+    contrastive_logits = apply_contrastive_with_predicted_neg_batch(
+        pos_logits, predicted_neg_logits,
+    )  # (B, S, K) in log-prob space
+    pred_tokens = greedy_sample_batch(contrastive_logits)  # (B, S)
+    correct = (pred_tokens == target_token_ids)  # (B, S)
+
+    cumprod_correct = torch.cumprod(correct.int(), dim=1)  # (B, S)
+    acc_len = cumprod_correct.sum(dim=1)  # (B,)
+    correct_mask = (cumprod_correct == 1)
+
+    if single_sample:
+        return acc_len.squeeze(0), correct_mask.squeeze(0)
+    return acc_len, correct_mask
+
+
+def compute_reward_components_with_predicted_neg_batch(
+    pos_logits: torch.Tensor,               # (B, S, K)
+    predicted_neg_logits: torch.Tensor,       # (B, S, K)
+    topk_token_ids: torch.Tensor,             # (B, S, K)
+    target_token_ids: torch.Tensor,           # (B, S)
+    baseline_acc_len: torch.Tensor,           # (B,) baseline acceptance length
+    gamma: float = 7.0,
+    lambda_: float = 3.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute reward components for negative logit prediction.
+
+    r1: rank improvement — how many positions the target token moves up
+    r2: top-1 bonus — extra reward when target reaches rank 0
+    r3: acceptance length change (vs baseline)
+
+    Returns:
+        r1, r2, r3, acc_len_contrastive: each (B,)
+    """
+    pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids, baseline_acc_len, single_sample = (
+        _ensure_batched_inputs_predicted_neg(
+            pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids,
+            baseline_acc_len=baseline_acc_len,
+        )
+    )
+
+    B, S, K = pos_logits.shape
+    device = pos_logits.device
+
+    # ── Rank before CD ──
+    ranks_before = get_rank_in_topk_batch(target_token_ids, topk_token_ids)  # (B, S)
+
+    # ── Apply CD with predicted negative logits ──
+    contrastive_logits = apply_contrastive_with_predicted_neg_batch(
+        pos_logits, predicted_neg_logits,
+    )  # (B, S, K) in log-prob space (from log_softmax)
+    contrastive_probs = F.softmax(contrastive_logits, dim=-1)  # convert to probs
+
+    # ── Rank after CD ──
+    # Find probability of target token in the CD distribution
+    rank_before_indices = get_rank_in_topk_batch(target_token_ids, topk_token_ids)  # (B, S)
+    valid = rank_before_indices < K
+    gather_idx = rank_before_indices.clone()
+    gather_idx[~valid] = 0
+    target_probs = torch.gather(
+        contrastive_probs, dim=-1, index=gather_idx.unsqueeze(-1)
+    ).squeeze(-1)  # (B, S)
+    target_probs[~valid] = 0.0
+
+    # Count how many tokens have higher probability than target
+    rank_after = (contrastive_probs > target_probs.unsqueeze(-1)).sum(dim=-1)  # (B, S)
+    rank_after[~valid] = K
+
+    # ── r1: Rank improvement ──
+    delta_rank = ranks_before - rank_after  # (B, S)
+    i = torch.arange(S, device=device, dtype=torch.float32)  # (S,)
+    weights = torch.exp(-i / gamma)  # (S,)
+    r1 = (delta_rank * weights).sum(dim=1)  # (B,)
+
+    # ── r2: Top-1 bonus ──
+    r2 = ((rank_after == 0).float() * 2.0 * weights).sum(dim=1)  # (B,)
+
+    # ── r3: Acceptance length change ──
+    acc_len_contrastive, _ = simulate_acceptance_length_with_predicted_neg_batch(
+        pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids,
+    )  # (B,)
+
+    if baseline_acc_len is None:
+        raise ValueError("baseline_acc_len is required")
+    delta = acc_len_contrastive - baseline_acc_len
+    r3 = torch.max(delta, torch.zeros_like(delta)) - lambda_ * torch.max(
+        -delta, torch.zeros_like(delta)
+    )
+
+    if single_sample:
+        return (r1.squeeze(0), r2.squeeze(0), r3.squeeze(0),
+                acc_len_contrastive.squeeze(0))
+
+    return r1, r2, r3, acc_len_contrastive
+
+
+def compute_reward_with_predicted_neg_total(
+    r1: torch.Tensor, r2: torch.Tensor, r3: torch.Tensor,
+    w1: float = 0.1, w2: float = 0.1, w3: float = 1.0,
+) -> torch.Tensor:
+    """Total reward = w1 * r1 + w2 * r2 + w3 * r3."""
+    return w1 * r1 + w2 * r2 + w3 * r3
+
+
+def _ensure_batched_inputs_predicted_neg(
+    pos_logits: torch.Tensor,
+    predicted_neg_logits: torch.Tensor,
+    topk_token_ids: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    baseline_acc_len: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], bool]:
+    """Ensure all tensors have batch dimension for vectorized processing."""
+    single_sample = pos_logits.dim() == 2
+    if single_sample:
+        pos_logits = pos_logits.unsqueeze(0)
+        predicted_neg_logits = predicted_neg_logits.unsqueeze(0)
+        topk_token_ids = topk_token_ids.unsqueeze(0)
+        target_token_ids = target_token_ids.unsqueeze(0)
+        if baseline_acc_len is not None:
+            if not torch.is_tensor(baseline_acc_len):
+                baseline_acc_len = torch.tensor(
+                    [baseline_acc_len], device=pos_logits.device, dtype=pos_logits.dtype,
+                )
+            elif baseline_acc_len.dim() == 0:
+                baseline_acc_len = baseline_acc_len.unsqueeze(0)
+    return (pos_logits, predicted_neg_logits, topk_token_ids, target_token_ids,
+            baseline_acc_len, single_sample)
+
+
 # Backward-compatible aliases used by training code and the local smoke test.
 simulate_acceptance_length_vectorized = simulate_acceptance_length_batch
 compute_reward_components_vectorized = compute_reward_components_batch
@@ -283,6 +451,120 @@ def _ensure_batched_inputs(
         baseline_acc_len,
         single_sample,
     )
+
+
+# ──────────────────────────────────────────────────────
+# Phase 1 Supervised Loss Functions
+# Train model to recognize target token via CD + auxiliary BCE
+# ──────────────────────────────────────────────────────
+
+def compute_phase1_loss(
+    pos_logits: torch.Tensor,               # (B, S, K)
+    predicted_neg_logits: torch.Tensor,      # (B, S, K) — model output
+    topk_token_ids: torch.Tensor,            # (B, S, K)
+    target_token_ids: torch.Tensor,          # (B, S)
+    lambda_bce: float = 0.2,
+    gamma: float = 7.0,
+    early_boost_n: int = 6,
+    early_boost_weight: float = 2.0,
+) -> dict:
+    """
+    Compute Phase 1 supervised loss: CE + auxiliary BCE.
+
+    CE:   Cross-entropy on CD output (target token should rank #1 in top-K)
+    BCE:  Binary classification — is this token the target? (uses -predicted_neg as logits)
+
+    Positional weighting:
+      - Base: exponential decay `exp(-t / gamma)` (higher weight for early tokens)
+      - Boost: first `early_boost_n` positions additionally multiplied by `early_boost_weight`
+
+    Returns dict with keys: 'loss', 'ce_loss', 'bce_loss', 'target_top1_acc',
+                            'target_top5_acc', 'target_mean_rank', 'bce_accuracy'
+    """
+    B, S, K = pos_logits.shape
+    device = pos_logits.device
+
+    # ── Find target index in top-K ──
+    # target_mask: (B, S, K) — 1 at the position of target token in top-K
+    target_mask = (topk_token_ids == target_token_ids.unsqueeze(-1)).float()
+    target_in_topk = target_mask.sum(dim=-1) > 0.5  # (B, S) — boolean
+    # argmax gives first occurrence index; for positions where target not in top-k it gives 0 (ignored later)
+    target_idx_in_topk = target_mask.argmax(dim=-1)  # (B, S)
+
+    # Valid positions: ~90% of positions have target in top-32
+    num_valid = target_in_topk.float().sum().clamp(min=1)
+
+    # ── Positional weights (exponential decay + early boost) ──
+    pos_indices = torch.arange(S, device=device, dtype=torch.float32)
+    weights = torch.exp(-pos_indices / gamma)  # (S,) — base exponential decay
+    # Extra boost for the first `early_boost_n` positions
+    if early_boost_n > 0 and early_boost_weight != 1.0:
+        boost = torch.ones(S, device=device, dtype=torch.float32)
+        boost[:early_boost_n] = early_boost_weight
+        weights = weights * boost
+    weight_per_position = weights.unsqueeze(0)  # (1, S)
+
+    # ── 1. CE Loss on CD output ──
+    # CD = log_softmax(pos) - log_softmax(predicted_neg)
+    cd_topk = F.log_softmax(pos_logits, dim=-1) - F.log_softmax(predicted_neg_logits, dim=-1)
+    # cd_topk: (B, S, K) — higher = more likely under CD
+
+    ce_per_position = F.cross_entropy(
+        cd_topk.reshape(-1, K),         # (B*S, K)
+        target_idx_in_topk.reshape(-1),  # (B*S,)
+        reduction='none',
+    ).reshape(B, S)
+
+    # Mask invalid positions (target not in top-K)
+    ce_masked = ce_per_position * target_in_topk.float() * weight_per_position
+    ce_loss = ce_masked.sum() / num_valid
+
+    # ── 2. BCE Auxiliary Loss ──
+    # -predicted_neg: high logit = likely target token (should have low penalty)
+    bce_logits = -predicted_neg_logits  # (B, S, K)
+    bce_per_position = F.binary_cross_entropy_with_logits(
+        bce_logits.reshape(-1, K),
+        target_mask.reshape(-1, K),
+        reduction='none',
+    ).reshape(B, S, K).mean(dim=-1)  # average over K → (B, S)
+
+    bce_masked = bce_per_position * target_in_topk.float() * weight_per_position
+    bce_loss = bce_masked.sum() / num_valid
+
+    # ── 3. Total ──
+    total_loss = ce_loss + lambda_bce * bce_loss
+
+    # ── 4. Metrics ──
+    with torch.no_grad():
+        # Rank of target after CD
+        cd_probs = F.softmax(cd_topk, dim=-1)  # (B, S, K)
+        # Gather probability of target token
+        gather_idx = target_idx_in_topk.unsqueeze(-1).clamp(0, K-1)
+        target_prob = torch.gather(cd_probs, dim=-1, index=gather_idx).squeeze(-1)  # (B, S)
+        # Count tokens with higher probability than target
+        rank_after = (cd_probs > target_prob.unsqueeze(-1)).sum(dim=-1)  # (B, S)
+        rank_after[~target_in_topk] = K  # invalid positions get K
+
+        target_top1 = (rank_after == 0).float()
+        target_top5 = (rank_after < 5).float()
+        target_top1_acc = (target_top1 * target_in_topk.float()).sum() / num_valid
+        target_top5_acc = (target_top5 * target_in_topk.float()).sum() / num_valid
+        target_mean_rank = (rank_after * target_in_topk.float()).sum() / num_valid
+
+        # BCE accuracy
+        bce_pred = (bce_logits > 0).float()  # (B, S, K)
+        bce_correct = (bce_pred == target_mask).float()
+        bce_accuracy = (bce_correct * target_in_topk.unsqueeze(-1).float()).sum() / (num_valid * K)
+
+    return {
+        'loss': total_loss,
+        'ce_loss': ce_loss.detach(),
+        'bce_loss': bce_loss.detach(),
+        'target_top1_acc': target_top1_acc,
+        'target_top5_acc': target_top5_acc,
+        'target_mean_rank': target_mean_rank,
+        'bce_accuracy': bce_accuracy,
+    }
 
 
 # ========== Kiểm thử ==========

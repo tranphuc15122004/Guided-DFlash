@@ -1,0 +1,211 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=48GB
+#PBS -l walltime=48:00:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+
+# ═══════════════════════════════════════════════════════════
+# Phase 2: Reinforcement Learning (A2C) for NegativeLogitPredictor
+#
+# Fine-tunes the Phase 1 policy via Actor-Critic RL to maximize
+# acceptance length and rank improvement.
+#
+# Usage:
+#   qsub script/train_negative_predictor_rl.pbs
+#
+# Override defaults via -v:
+#   qsub -v EPOCHS=30,LR=1e-4,FROM_PHASE1=/path/to/best.pt \
+#     script/train_negative_predictor_rl.pbs
+# ═══════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+  cd "$PBS_O_WORKDIR"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+mkdir -p logs
+
+JOB_TAG="${PBS_JOBID:-local_$(date +%Y%m%d_%H%M%S)}"
+LOG_FILE="logs/train_neg_pred_rl_${JOB_TAG}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ── Activate venv ──
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
+mkdir -p "$HF_HOME"
+
+echo "═══════════════════════════════════════════════════"
+echo "  Phase 2: NegativeLogitPredictor RL (A2C) Training"
+echo "═══════════════════════════════════════════════════"
+echo ""
+echo "Job ID:       ${PBS_JOBID:-local}"
+echo "Node:         $(hostname)"
+echo "Start time:   $(date)"
+echo "Work dir:     $(pwd)"
+echo ""
+
+# ── Environment info ──
+python - <<'PY'
+import torch
+print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}')
+print(f'CUDA version: {torch.version.cuda}')
+import h5py; print(f'h5py {h5py.__version__}')
+try:
+    import flash_attn; print(f'flash_attn {flash_attn.__version__}')
+except: print('flash_attn: not installed')
+PY
+echo ""
+
+# ── Configuration (override via env vars) ──
+H5_PATH="${H5_PATH:-alpha_model/alpha_dataset.h5}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/rl_${JOB_TAG}}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+EPOCHS="${EPOCHS:-10}"
+LR="${LR:-3e-4}"
+TOP_K="${TOP_K:-32}"
+HIDDEN_DIM="${HIDDEN_DIM:-128}"
+GAMMA_DECAY="${GAMMA_DECAY:-7.0}"
+LAMBDA_R3="${LAMBDA_R3:-3.0}"
+W1="${W1:-0.1}"
+W2="${W2:-0.1}"
+W3="${W3:-1.0}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.01}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+LR_MIN="${LR_MIN:-1e-6}"
+FROM_PHASE1="${FROM_PHASE1:-}"
+RESUME="${RESUME:-}"
+
+# Model variant flags (boolean: set to "1" to enable)
+PREDICT_DELTA="${PREDICT_DELTA:-0}"
+
+# ── Debug mode: use subset if DEBUG=1 ──
+if [[ "${DEBUG:-0}" = "1" ]]; then
+  echo "=== DEBUG MODE: Using subset of data ==="
+  EPOCHS=2
+  BATCH_SIZE=16
+  MAX_RECORDS=500
+else
+  MAX_RECORDS=0
+fi
+
+echo "═══════════════════════════════════════════════════"
+echo "  Training Configuration"
+echo "═══════════════════════════════════════════════════"
+echo "H5_PATH:              $H5_PATH"
+echo "OUTPUT_DIR:           $OUTPUT_DIR"
+echo "BATCH_SIZE:           $BATCH_SIZE"
+echo "EPOCHS:               $EPOCHS"
+echo "LR:                   $LR"
+echo "LR_SCHEDULER:         $LR_SCHEDULER"
+echo "LR_MIN:               $LR_MIN"
+echo "TOP_K:                $TOP_K"
+echo "HIDDEN_DIM:           $HIDDEN_DIM"
+echo "GAMMA_DECAY:          $GAMMA_DECAY"
+echo "LAMBDA_R3:            $LAMBDA_R3"
+echo "W1=$W1  W2=$W2  W3=$W3"
+echo "ENTROPY_COEF:         $ENTROPY_COEF"
+echo "MAX_GRAD_NORM:        $MAX_GRAD_NORM"
+echo "SAVE_INTERVAL:        $SAVE_INTERVAL"
+echo "MAX_RECORDS:          $MAX_RECORDS"
+echo "PREDICT_DELTA:        $PREDICT_DELTA"
+echo "FROM_PHASE1:          ${FROM_PHASE1:-(none)}"
+echo "RESUME:               ${RESUME:-(none)}"
+echo ""
+
+# ── Validate flags ──
+if [[ -z "$FROM_PHASE1" && -z "$RESUME" ]]; then
+  echo "[WARNING] Neither --from-phase1 nor --resume specified."
+  echo "  The actor will be randomly initialized (not recommended)."
+  echo "  Pass FROM_PHASE1=<path> to initialize from Phase 1 checkpoint."
+  echo ""
+fi
+
+if [[ -n "$RESUME" && -n "$FROM_PHASE1" ]]; then
+  echo "[INFO] Both --resume and --from-phase1 set. --resume takes precedence."
+  echo "  The --from-phase1 path will be ignored."
+  echo ""
+fi
+
+# ── Build extra args ──
+EXTRA_ARGS=""
+
+if [[ "$PREDICT_DELTA" = "1" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --predict-delta"
+  echo "[Flag] Using delta mode (output = delta added to original neg_logits)"
+fi
+
+if [[ -n "$FROM_PHASE1" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --from-phase1 $FROM_PHASE1"
+  echo "[Flag] Initializing actor from Phase 1: $FROM_PHASE1"
+fi
+
+if [[ -n "$RESUME" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --resume $RESUME"
+  echo "[Flag] Resuming full training from checkpoint: $RESUME"
+fi
+
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Starting Phase 2 RL training at $(date)"
+echo "───────────────────────────────────────────────"
+
+# ── Train ──
+time python -m alpha_model.train.train_negative_predictor \
+  --data-path "$H5_PATH" \
+  --output-dir "$OUTPUT_DIR" \
+  --max-records "$MAX_RECORDS" \
+  --batch-size "$BATCH_SIZE" \
+  --epochs "$EPOCHS" \
+  --lr "$LR" \
+  --top-k "$TOP_K" \
+  --hidden-dim "$HIDDEN_DIM" \
+  --gamma-decay "$GAMMA_DECAY" \
+  --lambda-r3 "$LAMBDA_R3" \
+  --w1 "$W1" \
+  --w2 "$W2" \
+  --w3 "$W3" \
+  --entropy-coef "$ENTROPY_COEF" \
+  --max-grad-norm "$MAX_GRAD_NORM" \
+  --save-interval "$SAVE_INTERVAL" \
+  --lr-scheduler "$LR_SCHEDULER" \
+  --lr-min "$LR_MIN" \
+  $EXTRA_ARGS \
+  --device cuda
+
+EXIT_CODE=$?
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Training finished at $(date)"
+echo "  Exit code: $EXIT_CODE"
+echo "───────────────────────────────────────────────"
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo ""
+  echo "=== Phase 2 RL training completed successfully ==="
+  echo "Output directory: $OUTPUT_DIR"
+  ls -lh "$OUTPUT_DIR"/ 2>/dev/null || echo "(output dir may be empty)"
+  echo ""
+  echo "Final actor checkpoint: ${OUTPUT_DIR}/checkpoints/best.pt"
+  echo "Training history:       ${OUTPUT_DIR}/training_history.csv"
+  echo ""
+  echo "To evaluate with CD_negative_model scheme:"
+  echo "  python -m scheme.CD_negative_model --negative-model-path ${OUTPUT_DIR}/checkpoints/best.pt"
+else
+  echo ""
+  echo "=== Phase 2 RL training FAILED (exit code: $EXIT_CODE) ==="
+  echo "Check log file: $LOG_FILE"
+fi
+
+exit $EXIT_CODE
