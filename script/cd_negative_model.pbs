@@ -1,0 +1,153 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=24GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/jp09+gdata/hn98
+#PBS -j oe
+
+# ═══════════════════════════════════════════════════════════
+# CD_negative_model inference job
+#
+# Runs the learned-negative-logit CD variant with top-32-only
+# token selection in scheme/CD_negative_model.py.
+#
+# Usage:
+#   qsub script/cd_negative_model.pbs
+#
+# Override defaults via -v:
+#   qsub -v NEGATIVE_MODEL_PATH=/path/to/best.pt,DATASET=gsm8k \
+#     script/cd_negative_model.pbs
+# ═══════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+  cd "$PBS_O_WORKDIR"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+mkdir -p logs
+
+JOB_TAG="${PBS_JOBID:-local_$(date +%Y%m%d_%H%M%S)}"
+LOG_FILE="logs/cd_negative_model_${JOB_TAG}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ── Activate venv ──
+source /scratch/jp09/dd9648/venvs/dflash_h100/bin/activate
+unset PYTHONPATH
+export HF_HOME=/scratch/jp09/dd9648/.cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONFAULTHANDLER=1
+mkdir -p "$HF_HOME"
+
+echo "═══════════════════════════════════════════════════"
+echo "  CD_negative_model inference"
+echo "═══════════════════════════════════════════════════"
+echo ""
+echo "Job ID:       ${PBS_JOBID:-local}"
+echo "Node:         $(hostname)"
+echo "Start time:   $(date)"
+echo "Work dir:     $(pwd)"
+echo ""
+
+# ── Configuration (override via env vars) ──
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-4B}"
+DRAFT_NAME_OR_PATH="${DRAFT_NAME_OR_PATH:-z-lab/Qwen3-4B-DFlash-b16}"
+DATASET="${DATASET:-gsm8k}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+NUM_SAMPLES="${NUM_SAMPLES:-10}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+TEMPERATURE="${TEMPERATURE:-0.0}"
+BETA="${BETA:-0.1}"
+CD_ALPHA="${CD_ALPHA:-1.0}"
+NEGATIVE_CONTEXT_DROPOUT="${NEGATIVE_CONTEXT_DROPOUT:-0.3}"
+NEGATIVE_CONTEXT_NOISE_STD="${NEGATIVE_CONTEXT_NOISE_STD:-0.0}"
+NEGATIVE_HIDDEN_MODE="${NEGATIVE_HIDDEN_MODE:-mask_zero}"
+NEGATIVE_MODEL_PATH="${NEGATIVE_MODEL_PATH:-checkpoints/phase1/checkpoints/best.pt}"
+PREDICT_DELTA="${PREDICT_DELTA:-0}"
+SEED="${SEED:-42}"
+DEVICE="${DEVICE:-cuda}"
+
+echo "═══════════════════════════════════════════════════"
+echo "  Runtime Configuration"
+echo "═══════════════════════════════════════════════════"
+echo "MODEL_NAME_OR_PATH:         $MODEL_NAME_OR_PATH"
+echo "DRAFT_NAME_OR_PATH:         $DRAFT_NAME_OR_PATH"
+echo "DATASET:                    $DATASET"
+echo "BLOCK_SIZE:                 $BLOCK_SIZE"
+echo "NUM_SAMPLES:                $NUM_SAMPLES"
+echo "MAX_NEW_TOKENS:             $MAX_NEW_TOKENS"
+echo "TEMPERATURE:                $TEMPERATURE"
+echo "BETA:                       $BETA"
+echo "CD_ALPHA:                   $CD_ALPHA"
+echo "NEGATIVE_CONTEXT_DROPOUT:   $NEGATIVE_CONTEXT_DROPOUT"
+echo "NEGATIVE_CONTEXT_NOISE_STD:  $NEGATIVE_CONTEXT_NOISE_STD"
+echo "NEGATIVE_HIDDEN_MODE:       $NEGATIVE_HIDDEN_MODE"
+echo "NEGATIVE_MODEL_PATH:         $NEGATIVE_MODEL_PATH"
+echo "PREDICT_DELTA:              $PREDICT_DELTA"
+echo "SEED:                       $SEED"
+echo "DEVICE:                     $DEVICE"
+echo ""
+
+EXTRA_ARGS=""
+if [[ -n "$NEGATIVE_MODEL_PATH" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --negative-model-path $NEGATIVE_MODEL_PATH"
+fi
+
+if [[ "$PREDICT_DELTA" = "1" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --predict-delta"
+  echo "[Flag] Using delta mode for negative predictor"
+fi
+
+if [[ "${DEBUG:-0}" = "1" ]]; then
+  echo "[Flag] DEBUG mode enabled: reducing sample count"
+  NUM_SAMPLES=2
+  MAX_NEW_TOKENS=64
+fi
+
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Starting CD_negative_model at $(date)"
+echo "───────────────────────────────────────────────"
+
+time python -m scheme.CD_negative_model \
+  --model-name-or-path "$MODEL_NAME_OR_PATH" \
+  --draft-name-or-path "$DRAFT_NAME_OR_PATH" \
+  --dataset "$DATASET" \
+  --block-size "$BLOCK_SIZE" \
+  --num-samples "$NUM_SAMPLES" \
+  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --temperature "$TEMPERATURE" \
+  --beta "$BETA" \
+  --negative-context-dropout "$NEGATIVE_CONTEXT_DROPOUT" \
+  --negative-context-noise-std "$NEGATIVE_CONTEXT_NOISE_STD" \
+  --negative-hidden-mode "$NEGATIVE_HIDDEN_MODE" \
+  --cd-alpha "$CD_ALPHA" \
+  --seed "$SEED" \
+  --device "$DEVICE" \
+  $EXTRA_ARGS
+
+EXIT_CODE=$?
+echo ""
+echo "───────────────────────────────────────────────"
+echo "  Job finished at $(date)"
+echo "  Exit code: $EXIT_CODE"
+echo "───────────────────────────────────────────────"
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  echo ""
+  echo "=== CD_negative_model completed successfully ==="
+  echo "Log file: $LOG_FILE"
+else
+  echo ""
+  echo "=== CD_negative_model FAILED (exit code: $EXIT_CODE) ==="
+  echo "Check log file: $LOG_FILE"
+fi
+
+exit $EXIT_CODE

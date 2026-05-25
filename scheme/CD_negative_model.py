@@ -32,8 +32,6 @@ from model import *
 from alpha_model import (
     NegativeLogitPredictor,
     GaussianNegativePolicy,
-    build_full_neg_from_top32,
-    apply_cd_with_predicted_neg,
 )
 import distributed as dist
 from scheme.run_metadata import log_run_parameters
@@ -351,11 +349,13 @@ def dflash_generate(
             past_key_values_draft.crop(start)
 
             if not TOP64_MASK_MODE:
+                # beta-based candidate mask (default)
                 candidate_mask = build_cd_candidate_mask(
                     reference_logits=positive_draft_logits,
                     beta=beta,
                 )
             else:
+                # apply top-k candidate mask 
                 candidate_mask = build_topk_probability_mask(
                     reference_logits=positive_draft_logits,
                     top_k=64,
@@ -402,28 +402,21 @@ def dflash_generate(
                     neg_logits_prev,
                 )  # (1, block_size-1, 32)
 
-                # Build full-vocab negative distribution
-                full_neg = build_full_neg_from_top32(
-                    predicted_neg_logits=predicted_neg_logits,
-                    top32_token_ids=draft_topk_token_ids,
-                    vocab_size=positive_draft_logits.size(-1),
-                    fill_value=-1e9,
-                )
+                # Apply CD only inside the top-32 candidate set.
+                # The rest of the vocabulary is ignored at selection time.
+                top32_cd_logits = F.log_softmax(draft_topk_logits, dim=-1) - F.log_softmax(predicted_neg_logits, dim=-1)
 
-                # Apply CD with fixed alpha=1.0
-                final_logits = apply_cd_with_predicted_neg(
-                    positive_logits=positive_draft_logits,
-                    negative_logits_predicted=full_neg,
-                )
+                top32_best_indices = torch.argmax(top32_cd_logits, dim=-1, keepdim=True)
+                draft_tokens = torch.gather(draft_topk_token_ids, dim=-1, index=top32_best_indices).squeeze(-1)
 
                 # Save predicted neg logits for next block's temporal consistency
                 neg_logits_prev = predicted_neg_logits.detach()
+            else:
+                # Apply candidate mask
+                final_logits = apply_cd_candidate_filter(final_logits, candidate_mask)
 
-            # Apply candidate mask
-            final_logits = apply_cd_candidate_filter(final_logits, candidate_mask)
-
-            # Sample
-            draft_tokens = torch.argmax(final_logits, dim=-1)
+                # Sample
+                draft_tokens = torch.argmax(final_logits, dim=-1)
 
             # Verify with target model
             target_logits = target(

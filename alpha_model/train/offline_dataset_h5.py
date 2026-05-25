@@ -2,7 +2,7 @@ import h5py
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class HDF5BanditDataset(Dataset):
     def __init__(self, h5_path: str, device: str = "cpu"):
@@ -59,7 +59,12 @@ class HDF5BanditDataset(Dataset):
             "baseline_acc_len": self.baseline_acc_len[idx].item(),
         }
 
-def collate_bandit_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collate_bandit_batch(
+    batch: List[Dict[str, Any]],
+    augment_neg_std: float = 0.0,
+    augment_pos_std: float = 0.0,
+    augment_prob: float = 1.0,
+) -> Dict[str, Any]:
     """Gộp batch từ các dict."""
     pos_logits = torch.stack([item["pos_logits"] for item in batch], dim=0)
     neg_logits = torch.stack([item["neg_logits"] for item in batch], dim=0)
@@ -69,6 +74,14 @@ def collate_bandit_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     abs_pos = torch.stack([item["abs_pos"] for item in batch], dim=0)
     alpha_prev = torch.stack([item["alpha_prev"] for item in batch], dim=0)
     baseline_acc_len = torch.tensor([item["baseline_acc_len"] for item in batch], dtype=torch.float32)
+
+    if augment_prob > 0.0 and (augment_neg_std > 0.0 or augment_pos_std > 0.0):
+        if augment_prob >= 1.0 or torch.rand(()) < augment_prob:
+            if augment_pos_std > 0.0:
+                pos_logits = pos_logits + augment_pos_std * torch.randn_like(pos_logits)
+            if augment_neg_std > 0.0:
+                neg_logits = neg_logits + augment_neg_std * torch.randn_like(neg_logits)
+
     return {
         "pos_logits": pos_logits,
         "neg_logits": neg_logits,

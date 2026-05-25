@@ -82,6 +82,12 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 LR_MIN="${LR_MIN:-1e-5}"
 RESUME="${RESUME:-}"
+AUGMENT_MODE="${AUGMENT_MODE:-combined}" # options: none, noise, mixup, combined
+AUGMENT_NEG_STD="${AUGMENT_NEG_STD:-0.1}"
+AUGMENT_POS_STD="${AUGMENT_POS_STD:-0.1}"
+AUGMENT_PROB="${AUGMENT_PROB:-0.5}"
+SAMPLER_ALPHA="${SAMPLER_ALPHA:-1.0}"
+SAMPLER_MIN_WEIGHT="${SAMPLER_MIN_WEIGHT:-0.05}"
 
 # Model variant flags (boolean: set to "1" to enable)
 DENSE="${DENSE:-1}"
@@ -118,6 +124,12 @@ echo "SAVE_INTERVAL:        $SAVE_INTERVAL"
 echo "MAX_RECORDS:          $MAX_RECORDS"
 echo "DENSE:                $DENSE"
 echo "PREDICT_DELTA:        $PREDICT_DELTA"
+echo "AUGMENT_MODE:         $AUGMENT_MODE"
+echo "AUGMENT_NEG_STD:      $AUGMENT_NEG_STD"
+echo "AUGMENT_POS_STD:      $AUGMENT_POS_STD"
+echo "AUGMENT_PROB:         $AUGMENT_PROB"
+echo "SAMPLER_ALPHA:        $SAMPLER_ALPHA"
+echo "SAMPLER_MIN_WEIGHT:   $SAMPLER_MIN_WEIGHT"
 echo "RESUME:               ${RESUME:-(none)}"
 echo ""
 
@@ -137,6 +149,16 @@ fi
 if [[ -n "$RESUME" ]]; then
   EXTRA_ARGS="$EXTRA_ARGS --resume $RESUME"
   echo "[Flag] Resuming from checkpoint: $RESUME"
+fi
+
+if [[ "$AUGMENT_MODE" != "none" ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --augment-mode $AUGMENT_MODE"
+  EXTRA_ARGS="$EXTRA_ARGS --augment-neg-std $AUGMENT_NEG_STD"
+  EXTRA_ARGS="$EXTRA_ARGS --augment-pos-std $AUGMENT_POS_STD"
+  EXTRA_ARGS="$EXTRA_ARGS --augment-prob $AUGMENT_PROB"
+  EXTRA_ARGS="$EXTRA_ARGS --sampler-alpha $SAMPLER_ALPHA"
+  EXTRA_ARGS="$EXTRA_ARGS --sampler-min-weight $SAMPLER_MIN_WEIGHT"
+  echo "[Flag] Data augmentation enabled: mode=$AUGMENT_MODE"
 fi
 
 echo ""

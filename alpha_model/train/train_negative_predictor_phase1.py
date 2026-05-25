@@ -13,11 +13,13 @@ import argparse
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data import WeightedRandomSampler
 from tqdm import tqdm
 
 # ── Imports ──
@@ -97,8 +99,31 @@ def parse_args():
                         help="Learning rate scheduler type (cosine: auto cosine decay from lr to lr_min over epochs)")
     parser.add_argument("--lr-min", type=float, default=1e-6,
                         help="Minimum LR for cosine/linear/plateau schedulers")
+    parser.add_argument("--augment-mode", type=str, default="none",
+                        choices=["none", "weighted", "noise", "combined"],
+                        help="Data augmentation mode: weighted sampling, noise, or both")
+    parser.add_argument("--augment-neg-std", type=float, default=0.0,
+                        help="Std of Gaussian noise added to neg_logits during collate")
+    parser.add_argument("--augment-pos-std", type=float, default=0.0,
+                        help="Std of Gaussian noise added to pos_logits during collate")
+    parser.add_argument("--augment-prob", type=float, default=1.0,
+                        help="Probability of applying batch noise augmentation")
+    parser.add_argument("--sampler-alpha", type=float, default=1.0,
+                        help="Strength of difficulty-based oversampling; higher = more biased toward hard samples")
+    parser.add_argument("--sampler-min-weight", type=float, default=0.05,
+                        help="Lower bound for per-sample weights after normalization")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
+
+
+def build_sampling_weights(dataset: HDF5BanditDataset, sampler_alpha: float, sampler_min_weight: float) -> torch.Tensor:
+    """Build per-record weights that oversample harder samples using baseline acceptance length."""
+    baseline = dataset.baseline_acc_len.float()
+    inv_difficulty = 1.0 / (baseline + 1.0)
+    weights = inv_difficulty.pow(max(sampler_alpha, 0.0))
+    weights = weights / weights.mean().clamp_min(1e-8)
+    weights = weights.clamp_min(sampler_min_weight)
+    return weights
 
 
 def main():
@@ -121,11 +146,33 @@ def main():
         logger._write_log(f"  Dataset limited: {dataset.num_records} / {original_len} records")
     logger.log_dataset_info(dataset)
 
+    sampler = None
+    shuffle = True
+    if args.augment_mode in {"weighted", "combined"}:
+        sampler_weights = build_sampling_weights(dataset, args.sampler_alpha, args.sampler_min_weight)
+        if args.max_records > 0:
+            sampler_weights = sampler_weights[:dataset.num_records]
+        sampler = WeightedRandomSampler(
+            weights=sampler_weights,
+            num_samples=len(sampler_weights),
+            replacement=True,
+        )
+        shuffle = False
+        logger._write_log(
+            f"  Weighted sampler enabled: alpha={args.sampler_alpha}, min_weight={args.sampler_min_weight}"
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_bandit_batch,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        collate_fn=partial(
+            collate_bandit_batch,
+            augment_neg_std=args.augment_neg_std if args.augment_mode in {"noise", "combined"} else 0.0,
+            augment_pos_std=args.augment_pos_std if args.augment_mode in {"noise", "combined"} else 0.0,
+            augment_prob=args.augment_prob,
+        ),
         num_workers=0,
     )
 
