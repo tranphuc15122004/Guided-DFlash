@@ -384,6 +384,7 @@ def main():
                 actor_state=actor.state_dict(),
                 extra={'scheduler_state_dict': scheduler.state_dict() if scheduler else None},
                 is_best=True,
+                write_epoch_file=False,
             )
         if epoch % args.save_interval == 0:
             logger.save_checkpoint(

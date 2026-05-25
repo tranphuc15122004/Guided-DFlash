@@ -104,6 +104,30 @@ def analyze_target_tokens(
 	rank_compare_by_position: Dict[int, Dict[str, int]] = defaultdict(
 		lambda: {"total": 0, "pos_better": 0, "neg_better": 0, "tie": 0}
 	)
+	accepted_rank_pos_counter: Counter = Counter()
+	accepted_rank_neg_counter: Counter = Counter()
+	rejected_rank_pos_counter: Counter = Counter()
+	rejected_rank_neg_counter: Counter = Counter()
+	accepted_rank_delta_counter: Counter = Counter()
+	rejected_rank_delta_counter: Counter = Counter()
+	accepted_rank_pos_top1 = 0
+	accepted_rank_neg_top1 = 0
+	rejected_rank_pos_top1 = 0
+	rejected_rank_neg_top1 = 0
+	rejected_pos_in_topk: Dict[int, int] = defaultdict(int)
+	rejected_pos_top1: Dict[int, int] = defaultdict(int)
+	accepted_rank_compared = 0
+	rejected_rank_compared = 0
+	accepted_target_in_topk = 0
+	rejected_target_in_topk = 0
+	accepted_target_not_in_topk = 0
+	rejected_target_not_in_topk = 0
+	accepted_pos_better = 0
+	accepted_neg_better = 0
+	accepted_tie = 0
+	rejected_pos_better = 0
+	rejected_neg_better = 0
+	rejected_tie = 0
 
 	num_shards = 0
 	num_records = 0
@@ -171,11 +195,20 @@ def analyze_target_tokens(
 				tok = int(target_tokens[pos])
 				candidates = topk_ids[pos]
 				matches = np.where(candidates == tok)[0]
+				is_accepted = pos < int(rec.get("acceptance_length", 0))
 				if matches.size == 0:
 					total_target_not_in_topk += 1
+					if is_accepted:
+						accepted_target_not_in_topk += 1
+					else:
+						rejected_target_not_in_topk += 1
 					continue
 
 				total_target_in_topk += 1
+				if is_accepted:
+					accepted_target_in_topk += 1
+				else:
+					rejected_target_in_topk += 1
 				topk_idx = int(matches[0])
 				target_topk_index_counter[topk_idx] += 1
 				target_topk_index_by_position[pos][topk_idx] += 1
@@ -190,18 +223,52 @@ def analyze_target_tokens(
 				target_rank_neg_by_position[pos][neg_rank] += 1
 				rank_delta_counter[rank_delta] += 1
 				rank_delta_by_position[pos][rank_delta] += 1
+				if is_accepted:
+					accepted_rank_pos_counter[pos_rank] += 1
+					accepted_rank_neg_counter[neg_rank] += 1
+					accepted_rank_delta_counter[rank_delta] += 1
+					if pos_rank == 1:
+						accepted_rank_pos_top1 += 1
+					if neg_rank == 1:
+						accepted_rank_neg_top1 += 1
+				else:
+					rejected_rank_pos_counter[pos_rank] += 1
+					rejected_rank_neg_counter[neg_rank] += 1
+					rejected_rank_delta_counter[rank_delta] += 1
+					rejected_pos_in_topk[pos] += 1
+					if pos_rank == 1:
+						rejected_rank_pos_top1 += 1
+						rejected_pos_top1[pos] += 1
+					if neg_rank == 1:
+						rejected_rank_neg_top1 += 1
 
 				total_rank_compared += 1
 				rank_compare_by_position[pos]["total"] += 1
 				if pos_rank < neg_rank:
 					total_pos_better += 1
 					rank_compare_by_position[pos]["pos_better"] += 1
+					if is_accepted:
+						accepted_pos_better += 1
+					else:
+						rejected_pos_better += 1
 				elif pos_rank > neg_rank:
 					total_neg_better += 1
 					rank_compare_by_position[pos]["neg_better"] += 1
+					if is_accepted:
+						accepted_neg_better += 1
+					else:
+						rejected_neg_better += 1
 				else:
 					total_tie += 1
 					rank_compare_by_position[pos]["tie"] += 1
+					if is_accepted:
+						accepted_tie += 1
+					else:
+						rejected_tie += 1
+				if is_accepted:
+					accepted_rank_compared += 1
+				else:
+					rejected_rank_compared += 1
 
 	overall_top = _top_items(token_counter, top_n)
 
@@ -211,8 +278,14 @@ def analyze_target_tokens(
 
 	rank_pos_hist = {str(k): int(v) for k, v in sorted(target_rank_pos_counter.items(), key=lambda x: x[0])}
 	rank_neg_hist = {str(k): int(v) for k, v in sorted(target_rank_neg_counter.items(), key=lambda x: x[0])}
+	accepted_rank_pos_hist = {str(k): int(v) for k, v in sorted(accepted_rank_pos_counter.items(), key=lambda x: x[0])}
+	accepted_rank_neg_hist = {str(k): int(v) for k, v in sorted(accepted_rank_neg_counter.items(), key=lambda x: x[0])}
+	rejected_rank_pos_hist = {str(k): int(v) for k, v in sorted(rejected_rank_pos_counter.items(), key=lambda x: x[0])}
+	rejected_rank_neg_hist = {str(k): int(v) for k, v in sorted(rejected_rank_neg_counter.items(), key=lambda x: x[0])}
 	topk_index_hist = {str(k): int(v) for k, v in sorted(target_topk_index_counter.items(), key=lambda x: x[0])}
 	rank_delta_hist = {str(k): int(v) for k, v in sorted(rank_delta_counter.items(), key=lambda x: x[0])}
+	accepted_rank_delta_hist = {str(k): int(v) for k, v in sorted(accepted_rank_delta_counter.items(), key=lambda x: x[0])}
+	rejected_rank_delta_hist = {str(k): int(v) for k, v in sorted(rejected_rank_delta_counter.items(), key=lambda x: x[0])}
 
 	def _mean_from_hist(counter: Counter) -> float | None:
 		total = sum(counter.values())
@@ -222,8 +295,14 @@ def analyze_target_tokens(
 
 	rank_pos_mean = _mean_from_hist(target_rank_pos_counter)
 	rank_neg_mean = _mean_from_hist(target_rank_neg_counter)
+	accepted_rank_pos_mean = _mean_from_hist(accepted_rank_pos_counter)
+	accepted_rank_neg_mean = _mean_from_hist(accepted_rank_neg_counter)
+	rejected_rank_pos_mean = _mean_from_hist(rejected_rank_pos_counter)
+	rejected_rank_neg_mean = _mean_from_hist(rejected_rank_neg_counter)
 	topk_index_mean = _mean_from_hist(target_topk_index_counter)
 	rank_delta_mean = _mean_from_hist(rank_delta_counter)
+	accepted_rank_delta_mean = _mean_from_hist(accepted_rank_delta_counter)
+	rejected_rank_delta_mean = _mean_from_hist(rejected_rank_delta_counter)
 
 	def _rate(x: int, y: int) -> float:
 		if y <= 0:
@@ -260,6 +339,50 @@ def analyze_target_tokens(
 			"positive_better_rate": _rate(total_pos_better, total_rank_compared),
 			"negative_better_rate": _rate(total_neg_better, total_rank_compared),
 			"tie_rate": _rate(total_tie, total_rank_compared),
+			"accepted_part": {
+				"rank_compared_count": accepted_rank_compared,
+				"target_in_topk": accepted_target_in_topk,
+				"target_not_in_topk": accepted_target_not_in_topk,
+				"target_in_topk_rate": _rate(accepted_target_in_topk, accepted_rank_compared),
+				"target_rank_positive_mean": accepted_rank_pos_mean,
+				"target_rank_negative_mean": accepted_rank_neg_mean,
+				"rank_delta_mean": accepted_rank_delta_mean,
+				"target_rank_positive_top1_count": accepted_rank_pos_top1,
+				"target_rank_negative_top1_count": accepted_rank_neg_top1,
+				"target_rank_positive_top1_rate": _rate(accepted_rank_pos_top1, accepted_rank_compared),
+				"target_rank_negative_top1_rate": _rate(accepted_rank_neg_top1, accepted_rank_compared),
+				"positive_better_count": accepted_pos_better,
+				"negative_better_count": accepted_neg_better,
+				"tie_count": accepted_tie,
+				"positive_better_rate": _rate(accepted_pos_better, accepted_rank_compared),
+				"negative_better_rate": _rate(accepted_neg_better, accepted_rank_compared),
+				"tie_rate": _rate(accepted_tie, accepted_rank_compared),
+				"target_rank_positive_histogram": accepted_rank_pos_hist,
+				"target_rank_negative_histogram": accepted_rank_neg_hist,
+				"rank_delta_histogram": accepted_rank_delta_hist,
+			},
+			"rejected_part": {
+				"rank_compared_count": rejected_rank_compared,
+				"target_in_topk": rejected_target_in_topk,
+				"target_not_in_topk": rejected_target_not_in_topk,
+				"target_in_topk_rate": _rate(rejected_target_in_topk, rejected_rank_compared),
+				"target_rank_positive_mean": rejected_rank_pos_mean,
+				"target_rank_negative_mean": rejected_rank_neg_mean,
+				"rank_delta_mean": rejected_rank_delta_mean,
+				"target_rank_positive_top1_count": rejected_rank_pos_top1,
+				"target_rank_negative_top1_count": rejected_rank_neg_top1,
+				"target_rank_positive_top1_rate": _rate(rejected_rank_pos_top1, rejected_rank_compared),
+				"target_rank_negative_top1_rate": _rate(rejected_rank_neg_top1, rejected_rank_compared),
+				"positive_better_count": rejected_pos_better,
+				"negative_better_count": rejected_neg_better,
+				"tie_count": rejected_tie,
+				"positive_better_rate": _rate(rejected_pos_better, rejected_rank_compared),
+				"negative_better_rate": _rate(rejected_neg_better, rejected_rank_compared),
+				"tie_rate": _rate(rejected_tie, rejected_rank_compared),
+				"target_rank_positive_histogram": rejected_rank_pos_hist,
+				"target_rank_negative_histogram": rejected_rank_neg_hist,
+				"rank_delta_histogram": rejected_rank_delta_hist,
+			},
 			"target_topk_index_histogram": topk_index_hist,
 			"target_rank_positive_histogram": rank_pos_hist,
 			"target_rank_negative_histogram": rank_neg_hist,
@@ -337,10 +460,36 @@ def analyze_target_tokens(
 			}
 			for pos in sorted(target_topk_index_by_position.keys())
 		},
+		"rejected_pos_top1_by_position": {
+			str(pos): {
+				"rejected_in_topk_count": int(rejected_pos_in_topk[pos]),
+				"rejected_top1_count": int(rejected_pos_top1[pos]),
+				"rejected_top1_rate": _rate(rejected_pos_top1[pos], rejected_pos_in_topk[pos]),
+			}
+			for pos in sorted(rejected_pos_in_topk.keys())
+		},
 	}
 
 
 def _print_report(stats: Dict[str, Any], top_n: int, per_pos_top_n: int, show_positions: int) -> None:
+	def _print_split_section(title: str, section: Dict[str, Any]) -> None:
+		print(f"\n{title}:")
+		print(f"  Rank compared positions        : {section['rank_compared_count']}")
+		print(f"  Target in top-k                : {section['target_in_topk']}")
+		print(f"  Target not in top-k            : {section['target_not_in_topk']}")
+		print(f"  Target in top-k rate           : {section['target_in_topk_rate']:.6f}")
+		print(f"  Mean positive rank (1=best)    : {section['target_rank_positive_mean']}")
+		print(f"  Mean negative rank (1=best)    : {section['target_rank_negative_mean']}")
+		print(f"  Mean rank delta (neg-pos)      : {section['rank_delta_mean']}")
+		print(f"  Positive top-1 rate            : {section['target_rank_positive_top1_rate']:.6f}")
+		print(f"  Negative top-1 rate            : {section['target_rank_negative_top1_rate']:.6f}")
+		print(f"  Positive better rate           : {section['positive_better_rate']:.6f}")
+		print(f"  Negative better rate           : {section['negative_better_rate']:.6f}")
+		print(f"  Tie rate                       : {section['tie_rate']:.6f}")
+		print(f"  Target rank positive histogram : {section['target_rank_positive_histogram']}")
+		print(f"  Target rank negative histogram : {section['target_rank_negative_histogram']}")
+		print(f"  Rank delta histogram           : {section['rank_delta_histogram']}")
+
 	print("=" * 80)
 	print("Target Token Analysis")
 	print("=" * 80)
@@ -377,6 +526,9 @@ def _print_report(stats: Dict[str, Any], top_n: int, per_pos_top_n: int, show_po
 	print(f"  Negative better rate             : {rank_stats['negative_better_rate']:.6f}")
 	print(f"  Tie rate                         : {rank_stats['tie_rate']:.6f}")
 
+	_print_split_section("Accepted part (pos < acceptance_length)", rank_stats["accepted_part"])
+	_print_split_section("Rejected part (pos >= acceptance_length)", rank_stats["rejected_part"])
+
 	print(f"\nTop {per_pos_top_n} target top-k index (0-based):")
 	for row in rank_stats["target_topk_index_top"]:
 		print(f"  {row['topk_index']:>8}  {row['count']:>10}  {row['ratio']:.6f}")
@@ -392,6 +544,14 @@ def _print_report(stats: Dict[str, Any], top_n: int, per_pos_top_n: int, show_po
 	print(f"\nTop {per_pos_top_n} rank delta (neg - pos):")
 	for row in rank_stats["rank_delta_top"]:
 		print(f"  {row['delta']:>8}  {row['count']:>10}  {row['ratio']:.6f}")
+
+	rejected_pos_data = stats.get("rejected_pos_top1_by_position", {})
+	if rejected_pos_data:
+		print("\nRejected top-1 rate by position (only rejected tokens):")
+		print(f"  {'Pos':>4}  {'Rejected':>10}  {'Top-1':>8}  {'Top-1%':>8}")
+		for pos in sorted(rejected_pos_data.keys(), key=int):
+			d = rejected_pos_data[pos]
+			print(f"  {pos:>4}  {d['rejected_in_topk_count']:>10}  {d['rejected_top1_count']:>8}  {d['rejected_top1_rate']:>7.4f}")
 
 	print("\nTarget length distribution (length -> blocks):")
 	for length, count in stats["target_length_distribution"].items():

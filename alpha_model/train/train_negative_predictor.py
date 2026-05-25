@@ -443,6 +443,7 @@ def main():
                 is_best=True,
                 extra={'critic_optimizer': opt_critic.state_dict(),
                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None},
+                write_epoch_file=False,
             )
         if epoch % args.save_interval == 0:
             logger.save_checkpoint(

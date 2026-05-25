@@ -483,8 +483,8 @@ def parse_args():
     parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--num-samples", type=int, default=10)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--negative-context-dropout", type=float, default=0.3)
@@ -513,17 +513,15 @@ def main():
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
-        device_map=device,
         trust_remote_code=True,
-    ).eval()
+    ).to(device).eval()
 
     logger.info(f"Loading draft model: {args.draft_name_or_path}")
     draft = AutoModelForCausalLM.from_pretrained(
         args.draft_name_or_path,
         torch_dtype=torch.bfloat16,
-        device_map=device,
         trust_remote_code=True,
-    ).eval()
+    ).to(device).eval()
 
     # Extract draft model from the wrapper
     from model import get_dflash_model
@@ -534,19 +532,28 @@ def main():
     if args.negative_model_path:
         logger.info(f"Loading negative predictor: {args.negative_model_path}")
         checkpoint = torch.load(args.negative_model_path, map_location=device)
+        if 'actor_state_dict' in checkpoint:
+            state_dict = checkpoint['actor_state_dict']
+            logger.info("Extracted actor_state_dict from training checkpoint.")
+        else:
+            state_dict = checkpoint
         negative_model = NegativeLogitPredictor(
             top_k=32,
             hidden_dim=128,
             predict_delta=args.predict_delta,
         ).to(device).eval()
-        negative_model.load_state_dict(checkpoint)
+        missing, unexpected = negative_model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"Missing keys: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected keys: {unexpected}")
         logger.info("Negative predictor loaded successfully.")
 
     # Load dataset
     logger.info(f"Loading dataset: {args.dataset}")
     from alpha_model import load_and_process_dataset_ALPHA
     dataset = load_and_process_dataset_ALPHA(
-        data_name=args.dataset, split="test", max_samples=args.num_samples,
+        data_name=args.dataset, split="test", max_samples=args.max_samples,
     )
 
     # Tokenizer

@@ -359,6 +359,7 @@ class TrainingLogger:
         extra: Optional[Dict] = None,
         is_best: bool = False,
         tag: str = "",
+        write_epoch_file: bool = True,
     ):
         """Save a model checkpoint with metadata."""
         suffix = f"_{tag}" if tag else ""
@@ -378,8 +379,9 @@ class TrainingLogger:
         if extra:
             ckpt.update(extra)
 
-        torch.save(ckpt, path)
-        self._write_log(f"  Checkpoint saved: {filename}")
+        if write_epoch_file:
+            torch.save(ckpt, path)
+            self._write_log(f"  Checkpoint saved: {filename}")
 
         if is_best:
             best_path = self.checkpoint_dir / f"checkpoint_best.pt"
@@ -387,7 +389,7 @@ class TrainingLogger:
             self._write_log(f"  Best checkpoint saved: checkpoint_best.pt")
             print(f"     ★ Best {self._best_metric_name}={self._best_metric:.4f} saved")
 
-        return path
+        return path if write_epoch_file else (self.checkpoint_dir / "checkpoint_best.pt")
 
     def _write_ckpt_metadata(self, extra: Dict, epoch: int):
         """Lightweight metadata logging for periodic checkpoints."""
