@@ -560,3 +560,22 @@ python -m analysis.CDv2_target_survey
 | `analysis/alpha_bucket_analysis.py` | Bucket statistics from training logs |
 | `alpha_adjusting/alpha_analysis.py` | Offline alpha value sweep |
 | `script/run_h200_alpha_collect.sh` | H200 data collection bash launcher |
+
+---
+
+## Codex Working Memory
+
+Use this section as the cross-session working summary for future Codex work.
+
+- The research goal is to improve DFlash speculative decoding acceptance by changing how the negative draft distribution is used during contrastive decoding.
+- There are two learned control surfaces:
+  - **Alpha model**: learns per-position bucket alphas, typically 3 buckets over top-32 ranks. Runtime path is `scheme/CD_alpha_model.py`; model code is `alpha_model/model/alpha_model.py`; RL simulation is in `alpha_model/train/alpha_simulate.py`.
+  - **Negative predictor**: learns direct top-32 negative logits with fixed alpha=1.0. Model code is `alpha_model/model/negative_predictor.py`; supervised phase is `alpha_model/train/train_negative_predictor_phase1.py`; RL phase is `alpha_model/train/train_negative_predictor.py`.
+- The canonical CD formula in this repo is `log_softmax(pos) - alpha * log_softmax(neg)`. For the negative predictor it is `log_softmax(pos_topk) - log_softmax(predicted_neg_topk)`. Avoid raw `torch.log(softmax)` and avoid logit-space subtraction unless working on VCD.
+- Data collection stores positive top-k logits, negative logits gathered on the same positive top-k token IDs, top-k token IDs, target token IDs, normalized block/absolute positions, previous alphas, and baseline acceptance length. Training reads this through `HDF5BanditDataset`, which intentionally loads the whole HDF5 into RAM.
+- Runtime inference builds positive/negative draft logits by pairing normal and corrupted draft inputs in one draft forward pass. Negative context is usually random first-token replacement plus hidden-state masking (`mask_zero`) or hidden-state shuffling (`shuffle_tokens`).
+- Candidate filtering is a major behavior boundary: CD schemes usually mask to positive-model candidates via beta threshold or top-64 probability mask. If a target is outside top-32/top-k or filtered out by the candidate mask, learned alpha/logit shaping cannot recover it.
+- `scheme/CD_alpha_model.py` is the more current learned-runtime path: it supports checkpoint config inference, dense vs transformer alpha models, deterministic seeding, SDPA fallback, distributed gathering, and full-vocab alpha expansion from top-k buckets.
+- `scheme/CD_negative_model.py` should be treated carefully before benchmarking: it appears less aligned with the current `NegativeLogitPredictor.forward(pos, neg, block_pos, abs_pos)` API, because its generation path passes an extra `neg_logits_prev` argument and includes an older target verification/cache path. Verify and modernize it against `CD_alpha_model.py` before relying on results.
+- For HPC/PBS, preserve `#PBS -P jp09` and `#PBS -l storage=scratch/jp09+gdata/hn98`; use the venv directly and avoid `module load pytorch`.
+- The user often works on `scheme/CD_alpha_model.py`, `scheme/CD_negative_model.py`, `alpha_model/train/alpha_simulate.py`, and PBS launch scripts. Do not overwrite local changes; check `git status --short` before edits.

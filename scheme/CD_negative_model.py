@@ -11,13 +11,16 @@ Key differences from CD_alpha_model.py:
   - apply_cd_with_predicted_neg() replaces apply_cd_logits_dynamic()
   - build_full_neg_from_top32() replaces _build_full_alpha_from_buckets()
   - No bucket logic (thresholds, num_alpha_buckets)
+DONE
 """
 
 import argparse
+import json
 import os
 import time
 import random
 from itertools import chain
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 from loguru import logger
@@ -28,16 +31,181 @@ from rich import print
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from model import *
-from alpha_model import (
-    NegativeLogitPredictor,
-    GaussianNegativePolicy,
+from model import (
+    DFlashDraftModel,
+    apply_cd_logits,
+    extract_context_feature,
+    load_and_process_dataset,
+    sample,
 )
+from alpha_model import NegativeLogitPredictor, NegativeLogitPredictor_Dense
 import distributed as dist
-from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero'
 TOP64_MASK_MODE = False
+
+
+def _extract_state_dict(checkpoint: dict) -> dict:
+    if isinstance(checkpoint, dict):
+        for state_key in ("state_dict", "model_state_dict", "actor_state_dict"):
+            if state_key in checkpoint and isinstance(checkpoint[state_key], dict):
+                logger.info(f"Extracted {state_key} from training checkpoint.")
+                return _strip_inference_unused_keys(checkpoint[state_key])
+    return checkpoint
+
+
+def _strip_inference_unused_keys(state_dict: dict) -> dict:
+    """Remove policy-only parameters when loading an actor for deterministic inference."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if key not in {"log_std"}
+    }
+
+
+def _as_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _as_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_checkpoint_config(checkpoint: dict, checkpoint_path: str) -> dict:
+    """Read training args saved by TrainingLogger, either in checkpoint or sibling config.json."""
+    config = {}
+    if isinstance(checkpoint, dict):
+        for key in ("config", "args", "model_config"):
+            candidate = checkpoint.get(key)
+            if isinstance(candidate, dict):
+                config.update(candidate)
+
+    config_path = Path(checkpoint_path).resolve().parent.parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                file_config = json.load(handle)
+            config.update(file_config)
+            logger.info(f"Loaded negative predictor training config: {config_path}")
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Could not read negative predictor config {config_path}: {exc}")
+    return config
+
+
+def _detect_negative_model_type(state_dict: dict) -> str:
+    if "encoder.net.0.weight" in state_dict:
+        return "regular"
+    if "token_projector.0.weight" in state_dict:
+        return "dense"
+    raise ValueError(
+        "Unknown negative predictor checkpoint type. Expected keys "
+        "'encoder.net.0.weight' (regular) or 'token_projector.0.weight' (dense). "
+        f"Got keys: {list(state_dict.keys())[:10]}..."
+    )
+
+
+def infer_negative_model_config(state_dict: dict, default_ks: Optional[list[int]] = None) -> dict:
+    if default_ks is None:
+        default_ks = [5, 10, 20]
+    len_ks = len(default_ks)
+    model_type = _detect_negative_model_type(state_dict)
+
+    if model_type == "regular":
+        input_dim = state_dict["encoder.net.0.weight"].shape[1]
+        hidden_dim = state_dict["encoder.net.0.weight"].shape[0]
+        numerator = input_dim - 7 - 2 * len_ks
+        if numerator <= 0 or numerator % 7 != 0:
+            raise ValueError(f"Cannot infer regular negative predictor top_k from input_dim={input_dim}.")
+        return {
+            "model_type": "regular",
+            "top_k": numerator // 7,
+            "hidden_dim": hidden_dim,
+        }
+
+    input_dim = state_dict["token_projector.0.weight"].shape[1]
+    hidden_dim = state_dict["token_projector.0.weight"].shape[0]
+    numerator = input_dim - 7 - 2 * len_ks
+    output_dim = state_dict["block_mlp.6.weight"].shape[0]
+    if numerator <= 0 or numerator % 7 != 0:
+        raise ValueError(f"Cannot infer Dense negative predictor top_k from input_dim={input_dim}.")
+    top_k = numerator // 7
+    if output_dim % top_k != 0:
+        raise ValueError(
+            f"Cannot infer Dense negative predictor max_seq_len from "
+            f"output_dim={output_dim}, top_k={top_k}."
+        )
+    return {
+        "model_type": "dense",
+        "top_k": top_k,
+        "hidden_dim": hidden_dim,
+        "max_seq_len": output_dim // top_k,
+    }
+
+
+def build_negative_model_from_checkpoint(
+    checkpoint: dict,
+    checkpoint_path: str,
+    device: torch.device,
+    cli_predict_delta: bool,
+) -> torch.nn.Module:
+    state_dict = _extract_state_dict(checkpoint)
+    inferred = infer_negative_model_config(state_dict)
+    config = _load_checkpoint_config(checkpoint, checkpoint_path)
+
+    dense_from_config = _as_bool(config.get("dense"))
+    top_k_from_config = _as_int(config.get("top_k"))
+    hidden_dim_from_config = _as_int(config.get("hidden_dim"))
+    predict_delta_from_config = _as_bool(config.get("predict_delta"))
+
+    if dense_from_config is not None:
+        inferred["model_type"] = "dense" if dense_from_config else "regular"
+    if top_k_from_config is not None:
+        inferred["top_k"] = top_k_from_config
+    if hidden_dim_from_config is not None:
+        inferred["hidden_dim"] = hidden_dim_from_config
+
+    predict_delta = cli_predict_delta or bool(predict_delta_from_config)
+    inferred["predict_delta"] = predict_delta
+
+    if inferred["model_type"] == "dense":
+        negative_model = NegativeLogitPredictor_Dense(
+            top_k=inferred["top_k"],
+            hidden_dim=inferred["hidden_dim"],
+            predict_delta=predict_delta,
+            max_seq_len=inferred.get("max_seq_len", 15),
+        )
+    else:
+        negative_model = NegativeLogitPredictor(
+            top_k=inferred["top_k"],
+            hidden_dim=inferred["hidden_dim"],
+            predict_delta=predict_delta,
+        )
+
+    negative_model.to(device).eval()
+    load_result = negative_model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys:
+        logger.warning(f"Missing keys: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        logger.warning(f"Unexpected keys: {load_result.unexpected_keys}")
+    logger.info(f"Negative predictor loaded successfully with config: {inferred}.")
+    return negative_model
 
 
 def cuda_time() -> float:
@@ -318,13 +486,6 @@ def dflash_generate(
     acceptance_lengths = []
     draft_prefill = True
 
-    # Track previous predicted negative logits for temporal consistency
-    neg_logits_prev = torch.zeros(
-        (1, max(block_size - 1, 1), 32),
-        dtype=torch.float32,
-        device=model.device,
-    )
-
     while start < max_length:
         block_output_ids = output_ids[:, start: start + block_size].clone()
         block_position_ids = position_ids[:, start: start + block_size]
@@ -372,12 +533,14 @@ def dflash_generate(
                     )
                     divergence_accumulator.append(kl_val)
 
-                # Extract top-32 aligned logits
+                negative_top_k = getattr(negative_model, "top_k", 32)
+
+                # Extract top-k aligned logits expected by the negative predictor.
                 draft_topk_token_ids, draft_topk_logits, neg_logits_on_draft_topk_ids = (
                     _extract_topk_aligned_logits(
                         positive_logits=positive_draft_logits,
                         negative_logits=negative_draft_logits,
-                        top_k=32,
+                        top_k=negative_top_k,
                     )
                 )
 
@@ -399,77 +562,84 @@ def dflash_generate(
                     neg_logits_on_draft_topk_ids,
                     block_positions_norm,
                     abs_positions_norm,
-                    neg_logits_prev,
                 )  # (1, block_size-1, 32)
 
-                # Apply CD only inside the top-32 candidate set.
-                # The rest of the vocabulary is ignored at selection time.
-                top32_cd_logits = F.log_softmax(draft_topk_logits, dim=-1) - F.log_softmax(predicted_neg_logits, dim=-1)
-
-                top32_best_indices = torch.argmax(top32_cd_logits, dim=-1, keepdim=True)
-                draft_tokens = torch.gather(draft_topk_token_ids, dim=-1, index=top32_best_indices).squeeze(-1)
-
-                # Save predicted neg logits for next block's temporal consistency
-                neg_logits_prev = predicted_neg_logits.detach()
+                # Apply CD inside the top-k set, then scatter back to a sparse
+                # vocab-shaped tensor so sampling/verification follows benchmark.py.
+                topk_cd_logits = F.log_softmax(draft_topk_logits, dim=-1) - F.log_softmax(
+                    predicted_neg_logits, dim=-1
+                )
+                final_logits = torch.full_like(
+                    positive_draft_logits,
+                    torch.finfo(positive_draft_logits.dtype).min,
+                )
+                final_logits.scatter_(-1, draft_topk_token_ids, topk_cd_logits.to(final_logits.dtype))
+                final_logits = apply_cd_candidate_filter(final_logits, candidate_mask)
+                draft_tokens = sample(final_logits, temperature, gen=gen)
             else:
+                final_logits = apply_cd_logits(
+                    first_logits=positive_draft_logits,
+                    second_logits=negative_draft_logits,
+                    alpha=cd_alpha,
+                )
+
                 # Apply candidate mask
                 final_logits = apply_cd_candidate_filter(final_logits, candidate_mask)
 
                 # Sample
-                draft_tokens = torch.argmax(final_logits, dim=-1)
+                draft_tokens = sample(final_logits, temperature, gen=gen)
 
-            # Verify with target model
-            target_logits = target(
-                input_ids=None,
-                position_ids=block_position_ids[:, 1:],
-                past_key_values=past_key_values_target,
-                use_cache=True,
-            ).logits
-
-            # Update target KV cache
             if draft_prefill:
-                # First decode step: reuse prefill KV cache
-                past_key_values_target = DynamicCache.from_legacy(
-                    past_key_values_target, 1
-                )
                 draft_prefill = False
+                decode_start = cuda_time()
 
-            # Calculate acceptance
-            posterior = sample(target_logits, temperature, gen=gen)
-            acceptance_mask = (draft_tokens[:, :-1] == posterior[:, :-1])
-            acceptance_length = acceptance_mask.cumprod(dim=1).sum(dim=1)
+            block_output_ids[:, 1:] = draft_tokens
 
-            # Write accepted tokens to output
-            num_accepted = int(acceptance_length[0].item()) + 1
-            output_ids[:, start + 1: start + 1 + num_accepted] = draft_tokens[
-                :, :num_accepted
-            ]
+        output = target(
+            block_output_ids,
+            position_ids=block_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=True if block_size > 1 else False,
+        )
 
-            if num_accepted < draft_tokens.shape[1]:
-                # Write the bonus token (first non-accepted)
-                output_ids[:, start + 1 + num_accepted] = posterior[
-                    :, num_accepted
-                ]
+        posterior = sample(output.logits, temperature, gen=gen)
+        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+        output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-            acceptance_lengths.append(num_accepted)
-            start += num_accepted + 1
+        acceptance_lengths.append(acceptance_length + 1)
+        start += acceptance_length + 1
+        past_key_values_target.crop(start)
+        if block_size > 1:
+            target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
 
-            if any(
-                output_ids[0, start - 1].item() in stop_token_ids
-                for _ in range(1)
-            ):
-                break
+        if stop_token_ids is not None and any(
+            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
+        ):
+            break
 
-    time_to_generate = cuda_time() - decode_start
-    num_generated = min(start - num_input_tokens, max_new_tokens)
+    output_ids = output_ids[:, :max_length]
+    output_ids = output_ids[:, output_ids[0] != mask_token_id]
+    if stop_token_ids is not None:
+        stop_token_ids_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+        stop_token_indices = torch.isin(
+            output_ids[0][num_input_tokens:], stop_token_ids_tensor
+        ).nonzero(as_tuple=True)[0]
+        if stop_token_indices.numel() > 0:
+            output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
+
+    num_output_tokens = output_ids.shape[1] - num_input_tokens
+    total_decode_time = cuda_time() - decode_start
+    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
 
     return SimpleNamespace(
-        output_ids=output_ids[:, :start],
-        acceptance_lengths=acceptance_lengths,
-        time_to_first_token=time_to_first_token,
-        time_to_generate=time_to_generate,
-        num_generated=num_generated,
+        output_ids=output_ids,
         num_input_tokens=num_input_tokens,
+        num_output_tokens=num_output_tokens,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=time_per_output_token,
+        acceptance_lengths=acceptance_lengths,
     )
 
 
@@ -482,7 +652,7 @@ def parse_args():
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -496,113 +666,155 @@ def parse_args():
     parser.add_argument("--predict-delta", action="store_true",
                         help="Use delta mode for negative predictor")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable fully deterministic behavior for reproducible runs.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Deprecated compatibility option; device is selected from distributed local rank.",
+    )
     return parser.parse_args()
 
 
 @torch.inference_mode()
 def main():
     args = parse_args()
-    set_global_seed(args.seed)
+    set_global_seed(args.seed, deterministic=args.deterministic)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dist.init()
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(dist.local_rank())
+        device = torch.device(f"cuda:{dist.local_rank()}")
+        supports_bf16 = torch.cuda.is_bf16_supported() if hasattr(torch.cuda, "is_bf16_supported") else False
+        model_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+        if not supports_bf16:
+            logger.info("CUDA device does not support bfloat16. Falling back to float16.")
+    else:
+        logger.warning("CUDA is unavailable. Falling back to CPU inference; this benchmark will run much slower.")
+        device = torch.device("cpu")
+        model_dtype = torch.float32
     logger.info(f"Device: {device}")
+
+    def has_flash_attn() -> bool:
+        if not use_cuda:
+            return False
+        if args.deterministic:
+            logger.info("Deterministic mode enabled. Forcing SDPA attention backend.")
+            return False
+        try:
+            import flash_attn
+            return True
+        except ImportError:
+            logger.warning("flash_attn is not installed. Falling back to torch.sdpa. The speedup will be lower.")
+            return False
+
+    installed_flash_attn = has_flash_attn()
+    attn_implementation = "flash_attention_2" if installed_flash_attn else "sdpa"
 
     # Load models
     logger.info(f"Loading target model: {args.model_name_or_path}")
     target = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_implementation,
+        dtype=model_dtype,
         trust_remote_code=True,
     ).to(device).eval()
 
     logger.info(f"Loading draft model: {args.draft_name_or_path}")
-    draft = AutoModelForCausalLM.from_pretrained(
+    draft_model = DFlashDraftModel.from_pretrained(
         args.draft_name_or_path,
-        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_implementation,
+        dtype=model_dtype,
         trust_remote_code=True,
     ).to(device).eval()
-
-    # Extract draft model from the wrapper
-    from model import get_dflash_model
-    draft_model = get_dflash_model(draft, target)
 
     # Load negative model if specified
     negative_model = None
     if args.negative_model_path:
         logger.info(f"Loading negative predictor: {args.negative_model_path}")
-        checkpoint = torch.load(args.negative_model_path, map_location=device)
-        if 'actor_state_dict' in checkpoint:
-            state_dict = checkpoint['actor_state_dict']
-            logger.info("Extracted actor_state_dict from training checkpoint.")
-        else:
-            state_dict = checkpoint
-        negative_model = NegativeLogitPredictor(
-            top_k=32,
-            hidden_dim=128,
-            predict_delta=args.predict_delta,
-        ).to(device).eval()
-        missing, unexpected = negative_model.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.warning(f"Missing keys: {missing}")
-        if unexpected:
-            logger.warning(f"Unexpected keys: {unexpected}")
-        logger.info("Negative predictor loaded successfully.")
+        checkpoint = torch.load(args.negative_model_path, map_location=device, weights_only=True)
+        negative_model = build_negative_model_from_checkpoint(
+            checkpoint=checkpoint,
+            checkpoint_path=args.negative_model_path,
+            device=device,
+            cli_predict_delta=args.predict_delta,
+        )
 
-    # Load dataset
+    block_size = args.block_size if args.block_size is not None else draft_model.block_size
+
     logger.info(f"Loading dataset: {args.dataset}")
-    from alpha_model import load_and_process_dataset_ALPHA
-    dataset = load_and_process_dataset_ALPHA(
-        data_name=args.dataset, split="test", max_samples=args.max_samples,
-    )
+    dataset = load_and_process_dataset(args.dataset)
+    if args.max_samples is not None and len(dataset) > args.max_samples:
+        dataset = dataset.shuffle(seed=args.seed).select(range(args.max_samples))
 
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.draft_name_or_path, trust_remote_code=True,
-    )
-    mask_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    stop_token_ids = [tokenizer.eos_token_id]
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-    # Generation loop
-    all_acceptance_lengths = []
-    for idx, sample_data in enumerate(tqdm(dataset, desc="Generating")):
-        input_text = sample_data["question"] if "question" in sample_data else sample_data["text"]
-        input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
-        input_ids = input_ids[:, :512]  # truncate to max context
+    responses = []
+    indices = range(dist.rank(), len(dataset), dist.size())
+    base_seed = args.seed
+    for idx in tqdm(indices, disable=not dist.is_main()):
+        sample_seed = base_seed + idx + dist.rank() * 10_000_000
+        instance = dataset[idx]
+        messages = []
+        for turn_index, user_content in enumerate(instance["turns"]):
+            messages.append({"role": "user", "content": user_content})
+            input_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
-        result = dflash_generate(
-            model=draft_model,
-            target=target,
-            input_ids=input_ids,
-            mask_token_id=mask_token_id,
-            max_new_tokens=args.max_new_tokens,
-            block_size=args.block_size,
-            stop_token_ids=stop_token_ids,
-            temperature=args.temperature,
-            cd_alpha=args.cd_alpha,
-            beta=args.beta,
-            negative_context_dropout=args.negative_context_dropout,
-            negative_context_noise_std=args.negative_context_noise_std,
-            negative_hidden_mode=args.negative_hidden_mode,
-            negative_model=negative_model,
-            predict_delta=args.predict_delta,
-            seed=args.seed + idx,
-        )
+            response = {}
+            for bs in [1, block_size]:
+                response[bs] = dflash_generate(
+                    model=draft_model,
+                    target=target,
+                    input_ids=input_ids,
+                    mask_token_id=draft_model.mask_token_id,
+                    max_new_tokens=args.max_new_tokens,
+                    block_size=bs,
+                    stop_token_ids=[tokenizer.eos_token_id],
+                    temperature=args.temperature,
+                    cd_alpha=args.cd_alpha,
+                    beta=args.beta,
+                    negative_context_dropout=args.negative_context_dropout,
+                    negative_context_noise_std=args.negative_context_noise_std,
+                    negative_hidden_mode=args.negative_hidden_mode,
+                    negative_model=negative_model if bs > 1 else None,
+                    predict_delta=args.predict_delta,
+                    seed=sample_seed + bs,
+                )
 
-        all_acceptance_lengths.extend(result.acceptance_lengths)
-        logger.info(
-            f"Sample {idx}: generated {result.num_generated} tokens, "
-            f"avg acceptance length: "
-            f"{np.mean(result.acceptance_lengths):.2f}"
-        )
+            spec_response = response[block_size]
+            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
+            output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            messages.append({"role": "assistant", "content": output_text})
+            responses.append(response)
 
-    # Summary
-    if all_acceptance_lengths:
-        logger.info(
-            f"Overall acceptance length: "
-            f"mean={np.mean(all_acceptance_lengths):.3f}, "
-            f"std={np.std(all_acceptance_lengths):.3f}"
-        )
+    if dist.size() > 1:
+        responses = dist.gather(responses, dst=0)
+        if not dist.is_main():
+            return
+        responses = list(chain(*responses))
+
+    t1 = np.mean([r[1].time_per_output_token for r in responses])
+    tb = np.mean([r[block_size].time_per_output_token for r in responses])
+    print(f"Decoding speedup: {t1 / tb:.2f}")
+
+    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
+    print(f"Average Acceptance length: {tau:.2f}")
+
+    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
+    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
 
 
 if __name__ == "__main__":

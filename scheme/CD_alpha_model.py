@@ -18,7 +18,6 @@ import distributed as dist
 from scheme.run_metadata import log_run_parameters
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero' 
-    log_run_parameters("CD_alpha_model", args)
 TOP64_MASK_MODE = False 
 
 
