@@ -22,7 +22,7 @@ import random
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, List, Optional
 from loguru import logger
 import numpy as np
 import torch
@@ -43,6 +43,53 @@ import distributed as dist
 
 NEGATIVE_HIDDEN_MODE = 'mask_zero'
 TOP64_MASK_MODE = False
+
+
+class NegativeModelStatsCollector:
+    """Collect top-k tensors for offline NegativeLogitPredictor analysis."""
+
+    def __init__(
+        self,
+        output_dir: str,
+        rank: int = 0,
+        shard_size: int = 256,
+        max_records: Optional[int] = None,
+        store_float32: bool = False,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.rank = rank
+        self.shard_size = max(1, shard_size)
+        self.max_records = max_records
+        self.float_dtype = torch.float32 if store_float32 else torch.float16
+        self.buffer: list[dict[str, Any]] = []
+        self.num_records = 0
+        self.shard_id = 0
+
+    def _to_cpu(self, value: Any) -> Any:
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
+            if torch.is_floating_point(value):
+                value = value.to(self.float_dtype)
+            return value
+        return value
+
+    def add(self, record: dict[str, Any]) -> None:
+        if self.max_records is not None and self.num_records >= self.max_records:
+            return
+        self.buffer.append({key: self._to_cpu(value) for key, value in record.items()})
+        self.num_records += 1
+        if len(self.buffer) >= self.shard_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        out_file = self.output_dir / f"negative_stats_rank{self.rank:03d}_shard{self.shard_id:06d}.pt"
+        torch.save(self.buffer, out_file)
+        logger.info(f"Wrote {len(self.buffer)} negative model stats records to {out_file}")
+        self.buffer = []
+        self.shard_id += 1
 
 
 def _extract_state_dict(checkpoint: dict) -> dict:
@@ -440,6 +487,9 @@ def dflash_generate(
     divergence_accumulator: Optional[List[float]] = None,
     negative_model: Optional[NegativeLogitPredictor] = None,
     predict_delta: bool = False,
+    negative_stats_collector: Optional[NegativeModelStatsCollector] = None,
+    sample_idx: Optional[int] = None,
+    turn_index: Optional[int] = None,
     seed: int = 0,
 ) -> SimpleNamespace:
     gen = torch.Generator(device=model.device)
@@ -485,10 +535,12 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
+    block_index = 0
 
     while start < max_length:
         block_output_ids = output_ids[:, start: start + block_size].clone()
         block_position_ids = position_ids[:, start: start + block_size]
+        pending_stats_record = None
         if block_size > 1:
             draft_position_ids = position_ids[
                 :, start - target_hidden.shape[1]: start + block_size
@@ -569,6 +621,12 @@ def dflash_generate(
                 topk_cd_logits = F.log_softmax(draft_topk_logits, dim=-1) - F.log_softmax(
                     predicted_neg_logits, dim=-1
                 )
+                static_cd_topk_logits = F.log_softmax(draft_topk_logits, dim=-1) - F.log_softmax(
+                    neg_logits_on_draft_topk_ids, dim=-1
+                )
+                candidate_topk_mask = torch.gather(
+                    candidate_mask, dim=-1, index=draft_topk_token_ids,
+                )
                 final_logits = torch.full_like(
                     positive_draft_logits,
                     torch.finfo(positive_draft_logits.dtype).min,
@@ -576,6 +634,24 @@ def dflash_generate(
                 final_logits.scatter_(-1, draft_topk_token_ids, topk_cd_logits.to(final_logits.dtype))
                 final_logits = apply_cd_candidate_filter(final_logits, candidate_mask)
                 draft_tokens = sample(final_logits, temperature, gen=gen)
+
+                if negative_stats_collector is not None:
+                    pending_stats_record = {
+                        "sample_idx": sample_idx,
+                        "turn_index": turn_index,
+                        "block_index": int(block_index),
+                        "start_position": int(start),
+                        "seed": int(seed),
+                        "topk_token_ids": draft_topk_token_ids,
+                        "positive_topk_logits": draft_topk_logits,
+                        "negative_old_topk_logits": neg_logits_on_draft_topk_ids,
+                        "negative_pred_topk_logits": predicted_neg_logits,
+                        "static_cd_topk_logits": static_cd_topk_logits,
+                        "cd_topk_logits": topk_cd_logits,
+                        "candidate_topk_mask": candidate_topk_mask,
+                        "block_positions": block_positions_norm,
+                        "absolute_positions": abs_positions_norm,
+                    }
             else:
                 final_logits = apply_cd_logits(
                     first_logits=positive_draft_logits,
@@ -605,11 +681,23 @@ def dflash_generate(
 
         posterior = sample(output.logits, temperature, gen=gen)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+
+        if pending_stats_record is not None and negative_stats_collector is not None:
+            pending_stats_record.update(
+                {
+                    "acceptance_length": int(acceptance_length),
+                    "target_token_ids": posterior[:, :-1],
+                    "draft_token_ids": block_output_ids[:, 1:],
+                }
+            )
+            negative_stats_collector.add(pending_stats_record)
+
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
         acceptance_lengths.append(acceptance_length + 1)
         start += acceptance_length + 1
+        block_index += 1
         past_key_values_target.crop(start)
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
@@ -665,6 +753,29 @@ def parse_args():
                         help="Path to pretrained NegativeLogitPredictor checkpoint")
     parser.add_argument("--predict-delta", action="store_true",
                         help="Use delta mode for negative predictor")
+    parser.add_argument(
+        "--negative-stats-output-dir",
+        type=str,
+        default=None,
+        help="Optional directory for NegativeLogitPredictor top-k stats shards.",
+    )
+    parser.add_argument(
+        "--negative-stats-shard-size",
+        type=int,
+        default=256,
+        help="Number of generation blocks per negative stats shard.",
+    )
+    parser.add_argument(
+        "--negative-stats-max-records",
+        type=int,
+        default=None,
+        help="Optional cap on collected negative stats records per rank.",
+    )
+    parser.add_argument(
+        "--negative-stats-float32",
+        action="store_true",
+        help="Store floating tensors as float32 instead of float16 in stats shards.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--deterministic",
@@ -746,6 +857,42 @@ def main():
             cli_predict_delta=args.predict_delta,
         )
 
+    negative_stats_collector = None
+    if args.negative_stats_output_dir:
+        negative_stats_collector = NegativeModelStatsCollector(
+            output_dir=args.negative_stats_output_dir,
+            rank=dist.rank(),
+            shard_size=args.negative_stats_shard_size,
+            max_records=args.negative_stats_max_records,
+            store_float32=args.negative_stats_float32,
+        )
+        manifest_path = Path(args.negative_stats_output_dir) / f"manifest_rank{dist.rank():03d}.json"
+        manifest = {
+            "model_name_or_path": args.model_name_or_path,
+            "draft_name_or_path": args.draft_name_or_path,
+            "dataset": args.dataset,
+            "negative_model_path": args.negative_model_path,
+            "predict_delta": bool(args.predict_delta),
+            "block_size_arg": args.block_size,
+            "max_samples": args.max_samples,
+            "max_new_tokens": int(args.max_new_tokens),
+            "temperature": float(args.temperature),
+            "beta": float(args.beta),
+            "negative_context_dropout": float(args.negative_context_dropout),
+            "negative_context_noise_std": float(args.negative_context_noise_std),
+            "negative_hidden_mode": args.negative_hidden_mode,
+            "seed": int(args.seed),
+            "rank": int(dist.rank()),
+            "world_size": int(dist.size()),
+        }
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+        if negative_model is None:
+            logger.warning(
+                "--negative-stats-output-dir was set, but no --negative-model-path was provided. "
+                "No negative predictor stats records will be collected."
+            )
+
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     logger.info(f"Loading dataset: {args.dataset}")
@@ -790,6 +937,9 @@ def main():
                     negative_hidden_mode=args.negative_hidden_mode,
                     negative_model=negative_model if bs > 1 else None,
                     predict_delta=args.predict_delta,
+                    negative_stats_collector=negative_stats_collector if bs > 1 else None,
+                    sample_idx=idx,
+                    turn_index=turn_index,
                     seed=sample_seed + bs,
                 )
 
@@ -798,6 +948,9 @@ def main():
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+
+    if negative_stats_collector is not None:
+        negative_stats_collector.flush()
 
     if dist.size() > 1:
         responses = dist.gather(responses, dst=0)
